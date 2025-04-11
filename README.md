@@ -180,10 +180,30 @@ The first time you run the server, you'll need to authenticate with WhatsApp:
 
 Your session will be saved locally in the `whatsapp-sessions` directory and will be reused automatically on subsequent runs. If you don't authenticate using the QR code, you won't be able to use any WhatsApp functionality.
 
+### Authentication Status and Logout
+
+You can check your current authentication status and manage your session:
+
+- Use the `check_auth_status` tool to verify if you're currently authenticated
+- If you need to authenticate with a different WhatsApp account or re-authenticate:
+  1. Use the `logout` tool to log out from your current session
+  2. Then use the `get_qr_code` tool to authenticate with a new QR code
+
+This is particularly useful when:
+- You want to switch between different WhatsApp accounts
+- Your session has expired or been invalidated
+- You're experiencing connection issues and need to re-authenticate
+
 ## Available MCP Tools
 
 ### Authentication
+<<<<<<< Updated upstream
 - `get_qr_code`- Get the QR code for WhatsApp Web authentication
+=======
+- `get_qr_code`: Get the QR code for WhatsApp Web authentication
+- `check_auth_status`: Check if you're currently authenticated with WhatsApp
+- `logout`: Log out from WhatsApp and clear the current session
+>>>>>>> Stashed changes
 
 ### Contacts
 - `search_contacts`- Search for contacts by name or phone number
@@ -227,8 +247,10 @@ Your session will be saved locally in the `whatsapp-sessions` directory and will
 ### Authentication Issues
 
 - If the QR code doesn't appear, try restarting the server
-- If you're already authenticated, no QR code will be shown
+- If you're already authenticated, no QR code will be shown (use `check_auth_status` to verify)
+- If you need to re-authenticate, use the `logout` tool first, then request a new QR code
 - WhatsApp limits the number of linked devices; you may need to remove an existing device
+- If you receive a message saying "No QR code is currently available," but you're already authenticated, this is normal behavior - use `check_auth_status` to confirm your authentication status
 
 ### Connection Issues
 
