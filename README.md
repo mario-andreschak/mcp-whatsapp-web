@@ -8,6 +8,10 @@ With this MCP server, you can:
 - Send messages to individuals or groups
 - Send and receive media files (images, videos, documents, audio)
 
+![image](https://github.com/user-attachments/assets/7a28ff03-8f52-40f9-b676-2df1ebae0005)
+![image](https://github.com/user-attachments/assets/105e42c3-2f4d-49cf-9be1-f7d481e5a11b)
+
+
 ## Features
 
 - **TypeScript Implementation**: Fully typed codebase for better developer experience and code reliability
