@@ -183,26 +183,26 @@ Your session will be saved locally in the `whatsapp-sessions` directory and will
 ## Available MCP Tools
 
 ### Authentication
-- `get_qr_code`: Get the QR code for WhatsApp Web authentication
+- `get_qr_code`- Get the QR code for WhatsApp Web authentication
 
 ### Contacts
-- `search_contacts`: Search for contacts by name or phone number
-- `get_contact`: Get information about a specific contact
+- `search_contacts`- Search for contacts by name or phone number
+- `get_contact`- Get information about a specific contact
 
 ### Chats
-- `list_chats`: List available chats with metadata
-- `get_chat`: Get information about a specific chat
-- `get_direct_chat_by_contact`: Find a direct chat with a specific contact
+- `list_chats`- List available chats with metadata
+- `get_chat`- Get information about a specific chat
+- `get_direct_chat_by_contact`- Find a direct chat with a specific contact
 
 ### Messages
-- `list_messages`: Retrieve messages with optional filters
-- `get_message`: Get a specific message by ID
-- `send_message`: Send a text message to a chat
+- `list_messages`- Retrieve messages with optional filters
+- `get_message`- Get a specific message by ID
+- `send_message`- Send a text message to a chat
 
 ### Media
-- `send_file`: Send a file (image, video, document) to a chat
-- `send_audio_message`: Send an audio message (voice note)
-- `download_media`: Download media from a message
+- `send_file`- Send a file (image, video, document) to a chat
+- `send_audio_message`- Send an audio message (voice note)
+- `download_media`- Download media from a message
 
 ## Development
 
