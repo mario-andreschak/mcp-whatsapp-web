@@ -66,12 +66,12 @@ This MCP server consists of:
 
 ### Installation with FLUJO
 
-FLUJO provides a streamlined installation process:
+[FLUJO](https://github.com/mario-andreschak/FLUJO/) provides a streamlined installation process:
 
 1. Navigate to the MCP section in FLUJO
 2. Click "Add Server"
 3. Copy and paste this GitHub repository URL: `https://github.com/mario-andreschak/mcp-whatsapp-web`
-4. Click "Parse, Clone, Install, Build and Save"
+4. Click "Parse", "Clone, "Install", "Build" and "Update Server"
 
 FLUJO will automatically handle the cloning, dependency installation, and building process for you.
 
