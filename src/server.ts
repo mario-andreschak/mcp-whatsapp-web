@@ -87,6 +87,40 @@ export class WhatsAppMcpServer {
     log.info('MCP server connected via stdio.');
   }
 
+  /**
+   * Gracefully shutdown the server and clean up resources
+   * @returns A promise that resolves when shutdown is complete
+   */
+  async shutdown(): Promise<void> {
+    log.info('Shutting down WhatsApp MCP Server...');
+    
+    try {
+      // First destroy the WhatsApp client to properly close the Puppeteer browser
+      log.info('Destroying WhatsApp client...');
+      await this.whatsapp.destroy();
+      log.info('WhatsApp client destroyed successfully');
+      
+      // Close all SSE transports if any are active
+      const sessionIds = Object.keys(this.sseTransports);
+      if (sessionIds.length > 0) {
+        log.info(`Closing ${sessionIds.length} active SSE transports...`);
+        for (const sessionId of sessionIds) {
+          try {
+            // Clean up the transport
+            delete this.sseTransports[sessionId];
+          } catch (error) {
+            log.warn(`Error closing SSE transport ${sessionId}:`, error);
+          }
+        }
+      }
+      
+      log.info('Server shutdown completed successfully');
+    } catch (error) {
+      log.error('Error during server shutdown:', error);
+      throw error;
+    }
+  }
+
   private async startSseTransport(port = 3001) {
     log.info(`Starting MCP server with SSE transport on port ${port}...`);
     const app = express();

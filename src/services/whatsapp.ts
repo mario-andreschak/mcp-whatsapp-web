@@ -159,8 +159,36 @@ export class WhatsAppService {
 
   async destroy(): Promise<void> {
     log.info('Destroying WhatsApp client...');
-    await this.client.destroy();
-    this.isInitialized = false;
+    try {
+      // Ensure the client is properly destroyed to clean up the Puppeteer browser
+      await this.client.destroy();
+      this.isInitialized = false;
+      this.latestQrCode = null;
+      log.info('WhatsApp client destroyed successfully');
+      
+      // Force garbage collection if possible to ensure browser process is released
+      if (global.gc) {
+        log.debug('Forcing garbage collection...');
+        global.gc();
+      }
+    } catch (error) {
+      log.error('Error destroying WhatsApp client:', error);
+      throw error;
+    }
+  }
+
+  async logout(): Promise<void> {
+    log.info('Logging out of WhatsApp...');
+    try {
+      // Logout from WhatsApp
+      await this.client.logout();
+      this.isInitialized = false;
+      this.latestQrCode = null;
+      log.info('Successfully logged out of WhatsApp');
+    } catch (error) {
+      log.error('Error logging out of WhatsApp:', error);
+      throw error;
+    }
   }
 
   getClient(): WAWebJS.Client {
@@ -173,6 +201,12 @@ export class WhatsAppService {
 
   getLatestQrCode(): string | null {
     return this.latestQrCode;
+  }
+
+  isAuthenticated(): boolean {
+    // Check if the client is authenticated and connected
+    // isInitialized means the client is ready and authenticated
+    return this.isInitialized;
   }
 
   // --- Wrapper Methods for WhatsApp Functionality ---

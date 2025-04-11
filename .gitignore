@@ -10,3 +10,4 @@ wheels/
 .venv
 /node_modules
 /whatsapp-sessions
+*.html

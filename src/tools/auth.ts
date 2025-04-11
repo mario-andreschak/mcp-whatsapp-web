@@ -24,7 +24,115 @@ export function registerAuthTools(
     }
   );
 
+  server.tool(
+    'check_auth_status',
+    'Check if the WhatsApp client is authenticated and connected',
+    {},
+    async (): Promise<CallToolResult> => {
+      return await checkAuthStatus(whatsappService);
+    }
+  );
+
+  server.tool(
+    'logout',
+    'Logout from WhatsApp and clear the current session',
+    {},
+    async (): Promise<CallToolResult> => {
+      return await logoutFromWhatsApp(whatsappService);
+    }
+  );
+
   log.info('Authentication tools registered.');
+}
+
+/**
+ * Tool to logout from WhatsApp
+ * @param whatsappService The WhatsApp service instance
+ * @returns A promise that resolves to the tool result containing the logout status
+ */
+async function logoutFromWhatsApp(
+  whatsappService: WhatsAppService
+): Promise<CallToolResult> {
+  try {
+    if (!whatsappService.isAuthenticated()) {
+      log.info('Logout requested but client is not authenticated');
+      return {
+        content: [
+          {
+            type: 'text',
+            text: 'You are not currently authenticated with WhatsApp, so there is no need to logout.'
+          }
+        ],
+        isError: false
+      };
+    }
+
+    await whatsappService.logout();
+    
+    // After logout, we need to reinitialize to get a new QR code
+    await whatsappService.initialize();
+    
+    log.info('Successfully logged out and reinitialized WhatsApp client');
+    
+    return {
+      content: [
+        {
+          type: 'text',
+          text: 'Successfully logged out of WhatsApp. You can now use the get_qr_code tool to authenticate with a new session.'
+        }
+      ],
+      isError: false
+    };
+  } catch (error) {
+    log.error('Error logging out from WhatsApp:', error);
+    return {
+      content: [
+        {
+          type: 'text',
+          text: `Error logging out: ${error instanceof Error ? error.message : String(error)}`
+        }
+      ],
+      isError: true
+    };
+  }
+}
+
+/**
+ * Tool to check the authentication status of the WhatsApp client
+ * @param whatsappService The WhatsApp service instance
+ * @returns A promise that resolves to the tool result containing the authentication status
+ */
+async function checkAuthStatus(
+  whatsappService: WhatsAppService
+): Promise<CallToolResult> {
+  try {
+    const isAuthenticated = whatsappService.isAuthenticated();
+    
+    log.info(`Authentication status checked: ${isAuthenticated ? 'authenticated' : 'not authenticated'}`);
+    
+    return {
+      content: [
+        {
+          type: 'text',
+          text: isAuthenticated 
+            ? 'You are currently authenticated with WhatsApp and ready to use all features.' 
+            : 'You are not currently authenticated with WhatsApp. Please use the get_qr_code tool to authenticate.'
+        }
+      ],
+      isError: false
+    };
+  } catch (error) {
+    log.error('Error checking authentication status:', error);
+    return {
+      content: [
+        {
+          type: 'text',
+          text: `Error checking authentication status: ${error instanceof Error ? error.message : String(error)}`
+        }
+      ],
+      isError: true
+    };
+  }
 }
 
 /**
@@ -38,13 +146,25 @@ async function getQrCodeImage(
   try {
     const qrString = whatsappService.getLatestQrCode();
     
-    if (!qrString) {
-      log.info('No QR code available yet');
+    // Check if the client is already authenticated
+    if (whatsappService.isAuthenticated()) {
+      log.info('Client is already authenticated, no QR code needed');
       return {
         content: [
           {
             type: 'text',
-            text: 'No QR code is currently available. Please initialize the WhatsApp client first.'
+            text: 'You are already authenticated with WhatsApp. No QR code is needed.'
+          }
+        ],
+        isError: false
+      };
+    } else if (!qrString) {
+      log.info('No QR code available yet, client may be initializing');
+      return {
+        content: [
+          {
+            type: 'text',
+            text: 'No QR code is currently available. The WhatsApp client may still be initializing. Please try again in a few seconds.'
           }
         ],
         isError: false
