@@ -11,9 +11,10 @@ import { registerContactTools } from './tools/contacts.js';
 import { registerChatTools } from './tools/chats.js';
 import { registerMessageTools } from './tools/messages.js';
 import { registerMediaTools } from './tools/media.js';
+import { registerAuthTools } from './tools/auth.js';
 
 const SERVER_INFO: Implementation = {
-  name: 'whatsapp-mcp-server',
+  name: 'mcp-whatsapp-web',
   version: '1.0.0', // Consider reading from package.json
 };
 
@@ -40,6 +41,7 @@ export class WhatsAppMcpServer {
   private registerTools() {
     log.info('Registering MCP tools...');
     // Call tool registration functions here
+    registerAuthTools(this.server, this.whatsapp);
     registerContactTools(this.server, this.whatsapp);
     registerChatTools(this.server, this.whatsapp);
     registerMessageTools(this.server, this.whatsapp);

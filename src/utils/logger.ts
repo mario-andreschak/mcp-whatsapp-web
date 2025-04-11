@@ -4,7 +4,7 @@ import { pino } from 'pino'; // Use named import
 // In a real application, you might want more sophisticated configuration
 // based on environment variables (e.g., log level, pretty print)
 export const log = pino({
-  level: process.env.LOG_LEVEL || 'info',
+  level: process.env.LOG_LEVEL || 'error', // Default to error level
   transport: {
     target: 'pino-pretty',
     options: {

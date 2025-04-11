@@ -12,11 +12,8 @@ const {
 // Import types from the module
 import type WAWebJS from 'whatsapp-web.js';
 
-import qrcode from 'qrcode-terminal';
 import { log } from '../utils/logger.js';
 import path from 'path';
-// import fs from 'fs'; // Unused currently
-// import os from 'os'; // Unused currently
 
 // Define custom types or interfaces if needed, mapping from whatsapp-web.js types
 // For now, we'll use whatsapp-web.js types directly where possible,
@@ -59,6 +56,7 @@ export interface SimpleMessage {
 export class WhatsAppService {
   private client: WAWebJS.Client;
   private isInitialized = false;
+  private latestQrCode: string | null = null; // Added to store QR code
   // private dbService?: any; // Placeholder for optional DB service - Commented out
 
   constructor(/* dbService?: any */ /* Replace 'any' with actual DB service type */) {
@@ -92,12 +90,14 @@ export class WhatsAppService {
 
   private setupEventHandlers(): void {
     this.client.on('qr', (qr: string) => {
-      log.info('QR code received, please scan:');
-      qrcode.generate(qr, { small: true });
+      log.info('QR code received.');
+      this.latestQrCode = qr; // Store the QR code
+      // qrcodeTerminal.generate(qr, { small: true }); // Removed console logging
     });
 
     this.client.on('authenticated', () => { // No type needed for msg here
       log.info('WhatsApp client authenticated.');
+      this.latestQrCode = null; // Clear QR code once authenticated
     });
 
     this.client.on('auth_failure', (msg: string) => { // Add type string
@@ -135,6 +135,7 @@ export class WhatsAppService {
       this.isInitialized = false;
       // Handle disconnection, maybe attempt to reconnect
       // this.initialize().catch(err => log.error('Reconnection failed:', err));
+      this.latestQrCode = null; // Clear QR on disconnect
     });
 
     this.client.on('loading_screen', (percent: number, message: string) => { // Add types
@@ -168,6 +169,10 @@ export class WhatsAppService {
       log.warn('Accessing WhatsApp client before it is fully initialized.');
     }
     return this.client;
+  }
+
+  getLatestQrCode(): string | null {
+    return this.latestQrCode;
   }
 
   // --- Wrapper Methods for WhatsApp Functionality ---
@@ -249,10 +254,15 @@ export class WhatsAppService {
 
   async getMessages(chatId: string, limit = 50): Promise<SimpleMessage[]> {
     if (!this.isInitialized) throw new Error('WhatsApp client not ready');
-    const chat = await this.client.getChatById(chatId);
-    if (!chat) throw new Error(`Chat not found: ${chatId}`);
-    const messages = await chat.fetchMessages({ limit });
-    return messages.map(this.mapMessageToSimpleMessage);
+    try {
+      const chat = await this.client.getChatById(chatId);
+      if (!chat) throw new Error(`Chat not found: ${chatId}`);
+      const messages = await chat.fetchMessages({ limit });
+      return messages.map(this.mapMessageToSimpleMessage.bind(this));
+    } catch (error: any) {
+      log.error(`Failed to get messages for chat ${chatId}:`, error);
+      throw error;
+    }
   }
 
   async getMessageById(messageId: string): Promise<SimpleMessage | null> {
