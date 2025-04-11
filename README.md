@@ -200,9 +200,9 @@ This is particularly useful when:
 <<<<<<< Updated upstream
 - `get_qr_code`- Get the QR code for WhatsApp Web authentication
 =======
-- `get_qr_code`: Get the QR code for WhatsApp Web authentication
-- `check_auth_status`: Check if you're currently authenticated with WhatsApp
-- `logout`: Log out from WhatsApp and clear the current session
+- `get_qr_code`- Get the QR code for WhatsApp Web authentication
+- `check_auth_status`- Check if you're currently authenticated with WhatsApp
+- `logout`- Log out from WhatsApp and clear the current session
 >>>>>>> Stashed changes
 
 ### Contacts
@@ -228,19 +228,19 @@ This is particularly useful when:
 
 ### Project Structure
 
-- `src/index.ts`: Entry point
-- `src/server.ts`: MCP server implementation
-- `src/services/whatsapp.ts`: WhatsApp Web service
-- `src/tools/`: Tool implementations for various WhatsApp features
-- `src/types/`: TypeScript type definitions
-- `src/utils/`: Utility functions
+- `src/index.ts`- Entry point
+- `src/server.ts`- MCP server implementation
+- `src/services/whatsapp.ts`- WhatsApp Web service
+- `src/tools/`- Tool implementations for various WhatsApp features
+- `src/types/`- TypeScript type definitions
+- `src/utils/`- Utility functions
 
 ### Scripts
 
-- `npm run build`: Build the TypeScript code
-- `npm run dev`: Run in development mode with watch
-- `npm run lint`: Run ESLint
-- `npm run format`: Format code with Prettier
+- `npm run build`- Build the TypeScript code
+- `npm run dev`- Run in development mode with watch
+- `npm run lint`- Run ESLint
+- `npm run format`- Format code with Prettier
 
 ## Troubleshooting
 
