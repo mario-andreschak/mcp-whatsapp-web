@@ -122,14 +122,14 @@ This launches the MCP Inspector tool, which provides a web interface for testing
        "whatsapp": {
          "command": "node",
          "args": [
-           "{{PATH_TO_REPO}}/dist/index.js"
+           "PATH_TO/dist/index.js"
          ]
        }
      }
    }
    ```
 
-   Replace `{{PATH_TO_REPO}}` with the absolute path to the repository.
+   Replace `PATH_TO` with the absolute path to the repository.
 
 2. Save this as `claude_desktop_config.json` in your Claude Desktop configuration directory:
 
@@ -149,14 +149,14 @@ This launches the MCP Inspector tool, which provides a web interface for testing
        "whatsapp": {
          "command": "node",
          "args": [
-           "{{PATH_TO_REPO}}/dist/index.js"
+           "PATH_TO/dist/index.js"
          ]
        }
      }
    }
    ```
 
-   Replace `{{PATH_TO_REPO}}` with the absolute path to the repository.
+   Replace `PATH_TO` with the absolute path to the repository.
 
 2. Save this as `mcp.json` in your Cursor configuration directory:
 
