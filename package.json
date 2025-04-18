@@ -6,9 +6,9 @@
   "type": "module",
   "scripts": {
     "build": "tsc",
-    "start": "node dist/index.js",
-    "dev": "tsc -w & node --watch dist/index.js",
-    "debug": "npx @modelcontextprotocol/inspector node dist/index.js",
+    "start": "node --no-deprecation dist/index.js",
+    "dev": "tsc -w & node --no-deprecation --watch dist/index.js",
+    "debug": "npx @modelcontextprotocol/inspector node --no-deprecation --trace-deprecation dist/index.js",
     "lint": "eslint src/**/*.ts",
     "format": "prettier --write src/**/*.ts"
   },

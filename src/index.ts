@@ -1,3 +1,23 @@
+// At the very top of src/index.ts, before any imports
+if (process.argv.includes('--stdio') || 
+    (!process.argv.includes('--sse') && process.env.TRANSPORT !== 'sse')) {
+  // Redirect stdout and stderr to prevent breaking MCP protocol
+  
+  // Silently discard all stdout writes
+  process.stdout.write = function(): boolean {
+    return true; // Pretend it succeeded but don't actually write
+  };
+  
+  // Silently discard all stderr writes
+  process.stderr.write = function(): boolean {
+    return true; // Pretend it succeeded but don't actually write
+  };
+  
+  // Also silence console methods
+  const noop = () => {};
+  console.log = console.info = console.debug = console.warn = console.error = noop;
+}
+
 import { WhatsAppMcpServer } from './server.js';
 import { log } from './utils/logger.js';
 
