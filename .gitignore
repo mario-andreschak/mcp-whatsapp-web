@@ -11,3 +11,4 @@ wheels/
 /node_modules
 /whatsapp-sessions
 *.html
+/logs

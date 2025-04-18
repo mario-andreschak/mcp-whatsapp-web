@@ -7,9 +7,8 @@ const isBrowser = typeof globalThis !== 'undefined' &&
                  typeof (globalThis as any).window !== 'undefined' && 
                  typeof (globalThis as any).window.localStorage !== 'undefined';
 
-// Determine if we're using stdio transport for MCP
-const usingStdioTransport = process.argv.includes('--stdio') || 
-  (!process.argv.includes('--sse') && process.env.TRANSPORT !== 'sse');
+// We're now always using the custom destination regardless of transport type
+// to ensure no logs go to stdout/stderr
 
 // Create log directory if it doesn't exist
 const logDir = path.join(process.cwd(), 'logs');
@@ -55,38 +54,13 @@ const customDestination = {
 };
 
 // Configure pino logger
-export const log = pino({
-  level: process.env.LOG_LEVEL || 'info',
-  // Use different transport based on environment
-  ...(usingStdioTransport
-    ? {
-        // When using stdio transport for MCP, use custom destination to avoid stdout
-        destination: customDestination
-      }
-    : {
-        // Otherwise use pino-pretty for console output plus file transport
-        transport: {
-          targets: [
-            // Pretty console output when not using stdio transport
-            {
-              target: 'pino-pretty',
-              options: {
-                colorize: true,
-                translateTime: 'SYS:standard',
-                ignore: 'pid,hostname',
-              },
-              level: 'info'
-            },
-            // Always write to file regardless of transport
-            {
-              target: 'pino/file',
-              options: { destination: logFilePath },
-              level: 'debug'
-            }
-          ]
-        }
-      })
-});
+export const log = pino(
+  {
+    level: process.env.LOG_LEVEL || 'info',
+  },
+  // Pass the custom destination as the second parameter
+  customDestination
+);
 
 // Add a method to retrieve logs (useful for debugging)
 export const getLogs = (): string => {
