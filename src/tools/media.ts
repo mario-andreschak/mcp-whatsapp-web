@@ -37,6 +37,7 @@ export function registerMediaTools(
       filename: z.string().optional().describe('Filename for the media (recommended if using media_content)'),
       caption: z.string().optional().describe('Optional caption for the media'),
       as_audio_message: z.boolean().optional().default(false).describe('Send audio specifically as a voice note (requires ffmpeg for conversion if not opus/ogg)'),
+      include_full_data: z.boolean().optional().default(false).describe('Whether to include the full base64 data in the response')
     },
     async ({
       recipient_jid,
@@ -47,6 +48,7 @@ export function registerMediaTools(
       filename,
       caption,
       as_audio_message,
+      include_full_data = false,
     }): Promise<CallToolResult> => {
       let mediaInput: string | null = null;
       let inputType: 'path' | 'url' | 'base64' | null = null;
@@ -154,13 +156,40 @@ export function registerMediaTools(
           }
         }
 
-        const result = {
+        // Create result object with basic info
+        const result: any = {
           success: true,
           message: `Media (${as_audio_message ? 'audio message' : 'file'}) sent successfully.`,
           messageId: sentMessage.id._serialized,
           timestamp: sentMessage.timestamp,
           filePathUsed: finalMediaPath // Include the path if a local file was ultimately sent
         };
+        
+        // If include_full_data is true, include the media content in the result
+        if (include_full_data && mediaInput) {
+          // For base64 input, we already have the data
+          if (inputType === 'base64') {
+            result.mediaData = media_content;
+            result.mimeType = mime_type;
+          } 
+          // For path or URL, we need to get the data
+          else if (inputType === 'path' && fs.existsSync(mediaInput)) {
+            try {
+              const buffer = fs.readFileSync(mediaInput);
+              result.mediaData = buffer.toString('base64');
+              
+              // Try to determine mime type
+              const detectedType = await fileTypeFromBuffer(buffer);
+              result.mimeType = detectedType?.mime || 'application/octet-stream';
+            } catch (err) {
+              log.warn(`Could not read file for include_full_data: ${err}`);
+            }
+          }
+          // For URL, we don't re-download it to include in the response
+        }
+        
+        log.debug('Send media result', JSON.stringify(result));
+        
         return {
           content: [{ type: 'text', text: JSON.stringify(result, null, 2) }],
         };
@@ -179,8 +208,9 @@ export function registerMediaTools(
     'Download media from a WhatsApp message and return its content.',
     {
       message_id: z.string().describe('The serialized ID of the message containing the media'),
+      include_full_data: z.boolean().optional().default(false).describe('Whether to include the full base64 data in the response')
     },
-    async ({ message_id }): Promise<CallToolResult> => {
+    async ({ message_id, include_full_data = false }): Promise<CallToolResult> => {
       try {
         const media = await whatsappService.downloadMedia(message_id);
         if (!media) {
@@ -190,40 +220,37 @@ export function registerMediaTools(
           };
         }
 
-        // Return media content based on type
+        // Extract metadata
+        const metadata = {
+          filename: media.filename || 'unknown',
+          mimetype: media.mimetype,
+          filesize: media.filesize || 'unknown'
+        };
+        
+        log.debug('Media metadata', JSON.stringify(metadata));
+
+        // Return media content based on type and include_full_data parameter
         let contentResult: TextContent | ImageContent | AudioContent;
         if (media.mimetype.startsWith('image/')) {
           contentResult = {
             type: 'image',
-            data: media.data,
+            data: include_full_data ? media.data : '',
             mimeType: media.mimetype,
           };
         } else if (media.mimetype.startsWith('audio/')) {
            contentResult = {
             type: 'audio',
-            data: media.data,
+            data: include_full_data ? media.data : '',
             mimeType: media.mimetype,
           };
         } else {
-          // For videos, documents, etc., return as text for now,
-          // potentially add specific content types later if MCP spec supports them.
-          // Or consider saving to a temp file and returning the path.
-          // For simplicity, returning base64 data with filename.
+          // For videos, documents, etc., return as text
           contentResult = {
-            type: 'text', // Representing binary data as text description + base64
-            text: `Downloaded media: ${media.filename || 'file'} (${media.mimetype}), Size: ${media.filesize || 'unknown'}\nBase64 Data: ${media.data}`
+            type: 'text',
+            text: include_full_data 
+              ? `Downloaded media: ${metadata.filename} (${metadata.mimetype}), Size: ${metadata.filesize}\nBase64 Data: ${media.data}`
+              : `Media info: ${metadata.filename} (${metadata.mimetype}), Size: ${metadata.filesize}`
           };
-           // Alternative: Save to temp and return path
-           /*
-           const tempDir = path.join(os.tmpdir(), 'whatsapp-media-downloads');
-           if (!fs.existsSync(tempDir)) fs.mkdirSync(tempDir);
-           const tempPath = path.join(tempDir, media.filename || `media_${message_id}`);
-           fs.writeFileSync(tempPath, Buffer.from(media.data, 'base64'));
-           contentResult = {
-               type: 'text',
-               text: `Media downloaded to temporary path: ${tempPath}`
-           };
-           */
         }
 
         return {
