@@ -229,32 +229,48 @@ export function registerMediaTools(
         
         log.debug('Media metadata', JSON.stringify(metadata));
 
-        // Return media content based on type and include_full_data parameter
-        let contentResult: TextContent | ImageContent | AudioContent;
-        if (media.mimetype.startsWith('image/')) {
-          contentResult = {
-            type: 'image',
-            data: include_full_data ? media.data : '',
-            mimeType: media.mimetype,
-          };
-        } else if (media.mimetype.startsWith('audio/')) {
-           contentResult = {
-            type: 'audio',
-            data: include_full_data ? media.data : '',
-            mimeType: media.mimetype,
-          };
-        } else {
-          // For videos, documents, etc., return as text
-          contentResult = {
-            type: 'text',
-            text: include_full_data 
-              ? `Downloaded media: ${metadata.filename} (${metadata.mimetype}), Size: ${metadata.filesize}\nBase64 Data: ${media.data}`
-              : `Media info: ${metadata.filename} (${metadata.mimetype}), Size: ${metadata.filesize}`
-          };
+        // Create a TextContent with metadata as the first item in the content array
+        const metadataContent: TextContent = {
+          type: 'text',
+          text: JSON.stringify(metadata, null, 2)
+        };
+        
+        // Prepare the array for the response content
+        const contentArray: Array<TextContent | ImageContent | AudioContent> = [metadataContent];
+        
+        // If include_full_data is true, add a second content object with the actual media data
+        if (include_full_data) {
+          if (media.mimetype.startsWith('image/')) {
+            // For images, add an ImageContent
+            contentArray.push({
+              type: 'image',
+              data: media.data,
+              mimeType: media.mimetype,
+            } as unknown as TextContent); // Type assertion to satisfy TypeScript
+          } else if (media.mimetype.startsWith('audio/')) {
+            // For audio, add an AudioContent
+            contentArray.push({
+              type: 'audio',
+              data: media.data,
+              mimeType: media.mimetype,
+            } as unknown as TextContent); // Type assertion to satisfy TypeScript
+          } else {
+            // For videos, documents, etc., add as TextContent
+            contentArray.push({
+              type: 'text',
+              text: `Base64 Data: ${media.data}`
+            });
+          }
         }
 
+        log.debug('Download media result', JSON.stringify({
+          metadata,
+          hasFullData: include_full_data,
+          mediaType: media.mimetype
+        }));
+
         return {
-          content: [contentResult],
+          content: contentArray,
         };
       } catch (error: any) {
         log.error(`Error in download_media tool for message ${message_id}:`, error);
