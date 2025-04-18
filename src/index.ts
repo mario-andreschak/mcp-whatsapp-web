@@ -1,3 +1,6 @@
+// Load environment variables from .env file
+import 'dotenv/config';
+
 // At the very top of src/index.ts, before any imports
 if (process.argv.includes('--stdio') || 
     (!process.argv.includes('--sse') && process.env.TRANSPORT !== 'sse')) {

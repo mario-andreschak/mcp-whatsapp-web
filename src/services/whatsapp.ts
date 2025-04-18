@@ -81,7 +81,11 @@ export class WhatsAppService {
           // '--single-process', // Might be needed on some systems
           '--disable-gpu',
         ],
-         // executablePath: '/path/to/chrome' // Uncomment and set if needed for video/gif sending
+        // Use Chrome executable path from environment variable if available
+        // This is needed for video/gif sending as Chromium (default) doesn't support H.264/AAC codecs
+        ...(process.env.CHROME_EXECUTABLE_PATH && {
+          executablePath: process.env.CHROME_EXECUTABLE_PATH
+        })
        },
        // qrTimeout option removed as it's not valid in whatsapp-web.js v1.23+
      };

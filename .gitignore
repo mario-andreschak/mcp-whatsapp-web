@@ -12,3 +12,4 @@ wheels/
 /whatsapp-sessions
 *.html
 /logs
+.env
