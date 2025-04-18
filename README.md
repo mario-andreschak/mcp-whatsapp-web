@@ -197,13 +197,9 @@ This is particularly useful when:
 ## Available MCP Tools
 
 ### Authentication
-<<<<<<< Updated upstream
-- `get_qr_code`- Get the QR code for WhatsApp Web authentication
-=======
 - `get_qr_code`- Get the QR code for WhatsApp Web authentication
 - `check_auth_status`- Check if you're currently authenticated with WhatsApp
 - `logout`- Log out from WhatsApp and clear the current session
->>>>>>> Stashed changes
 
 ### Contacts
 - `search_contacts`- Search for contacts by name or phone number
@@ -224,6 +220,32 @@ This is particularly useful when:
 - `send_audio_message`- Send an audio message (voice note)
 - `download_media`- Download media from a message
 
+## Browser Process Management
+
+This MCP server uses Puppeteer to control Chrome browsers for WhatsApp Web connectivity. The server includes a robust browser process management system to prevent orphaned Chrome processes.
+
+### Automatic Browser Cleanup
+
+The server automatically:
+- Tracks Chrome browser processes using a PID tracking system
+- Cleans up orphaned processes on startup
+- Properly closes browser processes during shutdown
+- Maintains a record of browser PIDs in `.chrome-pids.json`
+
+### Manual Browser Cleanup
+
+If you notice orphaned Chrome processes that weren't automatically cleaned up, you can use the included cleanup utility:
+
+```bash
+npm run cleanup-browsers
+```
+
+This utility will:
+1. Scan for Chrome processes that might be related to WhatsApp Web
+2. Display a list of potentially orphaned processes
+3. Ask for confirmation before terminating them
+4. Clean up the PID tracking file
+
 ## Development
 
 ### Project Structure
@@ -241,6 +263,7 @@ This is particularly useful when:
 - `npm run dev`- Run in development mode with watch
 - `npm run lint`- Run ESLint
 - `npm run format`- Format code with Prettier
+- `npm run cleanup-browsers`- Detect and clean up orphaned Chrome browser processes
 
 ## Troubleshooting
 
@@ -257,6 +280,14 @@ This is particularly useful when:
 - Make sure you have a stable internet connection
 - If the connection fails, try restarting the server
 - Check the logs for detailed error messages
+
+### Browser Process Issues
+
+- If you notice high CPU usage or memory consumption, there might be orphaned Chrome processes
+- Run `npm run cleanup-browsers` to detect and clean up orphaned processes
+- If the server crashes frequently, check for orphaned processes and clean them up
+- On Windows, you can also use Task Manager to look for multiple Chrome processes with "headless" in the command line
+- On Linux/macOS, use `ps aux | grep chrome` to check for orphaned processes
 
 ## License
 

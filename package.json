@@ -10,7 +10,8 @@
     "dev": "tsc -w & node --no-deprecation --watch dist/index.js",
     "debug": "npx @modelcontextprotocol/inspector node --no-deprecation --trace-deprecation dist/index.js",
     "lint": "eslint src/**/*.ts",
-    "format": "prettier --write src/**/*.ts"
+    "format": "prettier --write src/**/*.ts",
+    "cleanup-browsers": "node dist/utils/cleanup-browsers.js"
   },
   "keywords": [
     "mcp",

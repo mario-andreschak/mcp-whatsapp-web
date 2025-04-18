@@ -3,15 +3,15 @@ if (process.argv.includes('--stdio') ||
     (!process.argv.includes('--sse') && process.env.TRANSPORT !== 'sse')) {
   // Redirect stdout and stderr to prevent breaking MCP protocol
   
-  // Silently discard all stdout writes
-  process.stdout.write = function(): boolean {
-    return true; // Pretend it succeeded but don't actually write
-  };
+  // // Silently discard all stdout writes
+  // process.stdout.write = function(): boolean {
+  //   return true; // Pretend it succeeded but don't actually write
+  // };
   
-  // Silently discard all stderr writes
-  process.stderr.write = function(): boolean {
-    return true; // Pretend it succeeded but don't actually write
-  };
+  // // Silently discard all stderr writes
+  // process.stderr.write = function(): boolean {
+  //   return true; // Pretend it succeeded but don't actually write
+  // };
   
   // Also silence console methods
   const noop = () => {};
@@ -20,11 +20,14 @@ if (process.argv.includes('--stdio') ||
 
 import { WhatsAppMcpServer } from './server.js';
 import { log } from './utils/logger.js';
+import { BrowserProcessManager } from './utils/browser-process-manager.js';
 
 // Global reference to the server instance
 let serverInstance: WhatsAppMcpServer | null = null;
 // Flag to track if shutdown is in progress to prevent multiple shutdown attempts
 let isShuttingDown = false;
+// Global reference to the browser process manager for cleanup on exit
+const browserProcessManager = new BrowserProcessManager();
 
 /**
  * Gracefully shutdown the server and clean up resources
@@ -45,6 +48,10 @@ async function gracefulShutdown(signal: string): Promise<void> {
       await serverInstance.shutdown();
       // Set to null to prevent multiple shutdown attempts
       serverInstance = null;
+    } else {
+      // If server instance doesn't exist, we still need to clean up any browser processes
+      log.info('No server instance found, checking for orphaned browser processes...');
+      await browserProcessManager.cleanupOrphanedProcesses();
     }
     
     log.info('Shutdown completed successfully');
@@ -55,6 +62,13 @@ async function gracefulShutdown(signal: string): Promise<void> {
     }, 500);
   } catch (error) {
     log.error('Error during graceful shutdown:', error);
+    
+    // Try one last time to clean up browser processes
+    try {
+      await browserProcessManager.cleanupOrphanedProcesses();
+    } catch (cleanupError) {
+      log.error('Error during emergency browser process cleanup:', cleanupError);
+    }
     
     // Use a timeout to allow error logs to be flushed before exiting
     setTimeout(() => {
@@ -81,6 +95,15 @@ process.on('unhandledRejection', (reason) => {
 
 async function main() {
   log.info('Starting WhatsApp MCP Server...');
+  
+  // Clean up any orphaned browser processes before starting
+  try {
+    log.info('Checking for orphaned browser processes...');
+    await browserProcessManager.cleanupOrphanedProcesses();
+  } catch (error) {
+    log.warn('Error cleaning up orphaned processes during startup:', error);
+    // Continue with startup even if cleanup fails
+  }
 
   serverInstance = new WhatsAppMcpServer();
 

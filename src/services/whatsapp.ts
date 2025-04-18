@@ -14,6 +14,7 @@ import type WAWebJS from 'whatsapp-web.js';
 
 import { log } from '../utils/logger.js';
 import path from 'path';
+import { BrowserProcessManager } from '../utils/browser-process-manager.js';
 
 // Define custom types or interfaces if needed, mapping from whatsapp-web.js types
 // For now, we'll use whatsapp-web.js types directly where possible,
@@ -57,10 +58,12 @@ export class WhatsAppService {
   private client: WAWebJS.Client;
   private isInitialized = false;
   private latestQrCode: string | null = null; // Added to store QR code
+  private browserProcessManager: BrowserProcessManager;
   // private dbService?: any; // Placeholder for optional DB service - Commented out
 
   constructor(/* dbService?: any */ /* Replace 'any' with actual DB service type */) {
     // this.dbService = dbService; // Commented out
+    this.browserProcessManager = new BrowserProcessManager();
 
     const clientOptions: WAWebJS.ClientOptions = {
       authStrategy: new LocalAuth({
@@ -148,9 +151,22 @@ export class WhatsAppService {
       log.warn('WhatsApp client already initialized.');
       return;
     }
+    
+    // Clean up any orphaned browser processes before starting
+    await this.browserProcessManager.cleanupOrphanedProcesses();
+    
     log.info('Initializing WhatsApp client...');
     try {
       await this.client.initialize();
+      
+      // Register the browser process
+      const pid = await this.getBrowserPid();
+      if (pid) {
+        this.browserProcessManager.registerProcess(pid);
+        log.info(`Registered browser process with PID: ${pid}`);
+      } else {
+        log.warn('Could not determine browser PID after initialization');
+      }
     } catch (error) {
       log.error('Error initializing WhatsApp client:', error);
       throw error;
@@ -160,11 +176,20 @@ export class WhatsAppService {
   async destroy(): Promise<void> {
     log.info('Destroying WhatsApp client...');
     try {
+      // Get the PID before destroying the client
+      const pid = await this.getBrowserPid();
+      
       // Ensure the client is properly destroyed to clean up the Puppeteer browser
       await this.client.destroy();
       this.isInitialized = false;
       this.latestQrCode = null;
       log.info('WhatsApp client destroyed successfully');
+      
+      // Unregister the browser process
+      if (pid) {
+        this.browserProcessManager.unregisterProcess(pid);
+        log.info(`Unregistered browser process with PID: ${pid}`);
+      }
       
       // Force garbage collection if possible to ensure browser process is released
       if (global.gc) {
@@ -180,11 +205,20 @@ export class WhatsAppService {
   async logout(): Promise<void> {
     log.info('Logging out of WhatsApp...');
     try {
+      // Get the PID before logging out
+      const pid = await this.getBrowserPid();
+      
       // Logout from WhatsApp
       await this.client.logout();
       this.isInitialized = false;
       this.latestQrCode = null;
       log.info('Successfully logged out of WhatsApp');
+      
+      // Unregister the browser process
+      if (pid) {
+        this.browserProcessManager.unregisterProcess(pid);
+        log.info(`Unregistered browser process with PID: ${pid}`);
+      }
     } catch (error) {
       log.error('Error logging out of WhatsApp:', error);
       throw error;
@@ -392,5 +426,50 @@ export class WhatsAppService {
       type: message.type,
       // Add more fields as needed, e.g., ack status, quoted message info
     };
+  }
+  
+  /**
+   * Get the process ID of the Chrome browser used by this WhatsApp client
+   * @returns The browser PID or null if not available
+   */
+  async getBrowserPid(): Promise<number | null> {
+    try {
+      if (!this.client) {
+        return null;
+      }
+      
+      // Access the internal puppeteer browser
+      // This is a bit hacky but necessary to get the browser PID
+      const client = this.client as any;
+      
+      // Try different ways to access the browser
+      let browser = null;
+      
+      // Method 1: Try to access through pupBrowser property (if available)
+      if (client.pupBrowser) {
+        browser = client.pupBrowser;
+      } 
+      // Method 2: Try to access through _page property
+      else if (client._page && client._page.browser) {
+        browser = client._page.browser();
+      }
+      // Method 3: Try to access through puppeteer property
+      else if (client.puppeteer && client.puppeteer.browser) {
+        browser = client.puppeteer.browser;
+      }
+      
+      if (browser) {
+        const process = browser.process();
+        if (process) {
+          return process.pid;
+        }
+      }
+      
+      log.warn('Could not access browser PID through any known method');
+      return null;
+    } catch (error) {
+      log.error('Error getting browser PID:', error);
+      return null;
+    }
   }
 }

@@ -6,6 +6,7 @@ import express, { Request, Response } from 'express'; // Import Request and Resp
 // import { z } from 'zod'; // z is unused currently
 import { WhatsAppService } from './services/whatsapp.js';
 import { log } from './utils/logger.js';
+import { BrowserProcessManager } from './utils/browser-process-manager.js';
 // Import tool registration functions
 import { registerContactTools } from './tools/contacts.js';
 import { registerChatTools } from './tools/chats.js';
@@ -22,8 +23,10 @@ export class WhatsAppMcpServer {
   public readonly server: McpServer;
   private readonly whatsapp: WhatsAppService;
   private sseTransports: { [sessionId: string]: SSEServerTransport } = {};
+  private browserProcessManager: BrowserProcessManager;
 
   constructor() {
+    this.browserProcessManager = new BrowserProcessManager();
     this.whatsapp = new WhatsAppService();
 
     this.server = new McpServer(SERVER_INFO, {
@@ -62,6 +65,10 @@ export class WhatsAppMcpServer {
   async start(transportType: 'stdio' | 'sse' = 'stdio') {
     log.info(`Initializing WhatsApp client...`);
     try {
+      // Clean up any orphaned browser processes before starting
+      await this.browserProcessManager.cleanupOrphanedProcesses();
+      
+      // Initialize the WhatsApp client
       await this.whatsapp.initialize();
       log.info('WhatsApp client initialized successfully.');
     } catch (error) {
@@ -96,6 +103,7 @@ export class WhatsAppMcpServer {
     
     try {
       // First destroy the WhatsApp client to properly close the Puppeteer browser
+      // This will also unregister the browser PID
       log.info('Destroying WhatsApp client...');
       await this.whatsapp.destroy();
       log.info('WhatsApp client destroyed successfully');
@@ -112,6 +120,14 @@ export class WhatsAppMcpServer {
             log.warn(`Error closing SSE transport ${sessionId}:`, error);
           }
         }
+      }
+      
+      // Final check for any orphaned processes that might have been missed
+      try {
+        await this.browserProcessManager.cleanupOrphanedProcesses();
+      } catch (cleanupError) {
+        log.warn('Error during final browser process cleanup:', cleanupError);
+        // Continue with shutdown even if cleanup fails
       }
       
       log.info('Server shutdown completed successfully');
