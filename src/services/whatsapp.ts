@@ -72,14 +72,14 @@ export class WhatsAppService {
       puppeteer: {
         headless: true, // Run headless
         args: [
-          '--no-sandbox',
-          '--disable-setuid-sandbox',
-          '--disable-dev-shm-usage',
-          '--disable-accelerated-2d-canvas',
+          // '--no-sandbox',
+          // '--disable-setuid-sandbox',
+          // '--disable-dev-shm-usage',
+          // '--disable-accelerated-2d-canvas',
           '--no-first-run',
-          '--no-zygote',
+          // '--no-zygote',
           // '--single-process', // Might be needed on some systems
-          '--disable-gpu',
+          // '--disable-gpu',
         ],
         // Use Chrome executable path from environment variable if available
         // This is needed for video/gif sending as Chromium (default) doesn't support H.264/AAC codecs
