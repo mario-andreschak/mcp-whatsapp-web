@@ -60,6 +60,10 @@ export class WhatsAppService {
   private isInitialized = false;
   private latestQrCode: string | null = null; // Added to store QR code
   private latestPairingCode: string | null = null; // Set when phone number pairing is active
+  // True during the window between a QR scan / pairing approval and 'ready'
+  // (session validation + chat loading, typically 5-15s). Status checks and
+  // tool calls in this window should WAIT, not report "not authenticated".
+  private isAuthenticating = false;
   private browserProcessManager: BrowserProcessManager;
   private reconnectAttempts = 0;
   private reconnectTimer: NodeJS.Timeout | null = null;
@@ -129,6 +133,7 @@ export class WhatsAppService {
     client.on('qr', (qr: string) => {
       log.info('QR code received.');
       this.latestQrCode = qr; // Store the QR code
+      this.isAuthenticating = false; // A (new) QR means we are waiting for the user
     });
 
     // Fired when WHATSAPP_PAIRING_PHONE_NUMBER is configured. Written directly
@@ -155,12 +160,14 @@ export class WhatsAppService {
       log.info('WhatsApp client authenticated.');
       this.latestQrCode = null; // Clear QR code once authenticated
       this.latestPairingCode = null;
+      this.isAuthenticating = true; // Not ready yet; chats are still loading
     });
 
     client.on('auth_failure', (msg: string) => {
       log.error('WhatsApp authentication failure:', msg);
       this.isInitialized = false;
       this.latestQrCode = null;
+      this.isAuthenticating = false;
       this.notifySessionInvalidated();
       // Restart the client so a fresh QR code is emitted and
       // get_qr_code works again without a server restart.
@@ -170,6 +177,7 @@ export class WhatsAppService {
     client.on('ready', () => {
       log.info('WhatsApp client is ready.');
       this.isInitialized = true;
+      this.isAuthenticating = false;
       this.reconnectAttempts = 0;
       this.startHealthCheck();
     });
@@ -190,11 +198,18 @@ export class WhatsAppService {
       this.isInitialized = false;
       this.latestQrCode = null; // Clear QR on disconnect
       this.latestPairingCode = null;
+      this.isAuthenticating = false;
       this.scheduleReconnect(`disconnected: ${reason}`);
     });
 
     client.on('loading_screen', (percent: number, message: string) => {
       log.info(`WhatsApp loading: ${percent}% - ${message}`);
+      // A loading screen while a QR/pairing code is pending means the user
+      // just scanned/approved - flip to "authenticating" immediately so
+      // status checks during this window wait instead of saying "not authenticated".
+      if (this.latestQrCode || this.latestPairingCode) {
+        this.isAuthenticating = true;
+      }
     });
   }
 
@@ -417,13 +432,15 @@ export class WhatsAppService {
     if (this.isInitialized) return;
     const start = Date.now();
     log.info(`Tool call received while client is not ready; waiting up to ${Math.round(timeoutMs / 1000)}s...`);
+    const QR_GRACE_MS = 3_000; // Tolerate the just-scanned race before 'loading_screen' fires
     const deadline = start + timeoutMs;
     while (Date.now() < deadline) {
       if (this.isInitialized) {
         log.info(`Client became ready after ${((Date.now() - start) / 1000).toFixed(1)}s; continuing tool call.`);
         return;
       }
-      if (this.latestQrCode || this.latestPairingCode) {
+      const codePending = !!(this.latestQrCode || this.latestPairingCode);
+      if (codePending && !this.isAuthenticating && Date.now() - start >= QR_GRACE_MS) {
         throw new Error(
           'WhatsApp is not authenticated: a QR code / pairing code is waiting to be used. ' +
             'Authenticate via get_qr_code or request_pairing_code first.',
@@ -444,9 +461,16 @@ export class WhatsAppService {
    * instead of a premature "not authenticated".
    */
   async waitForAuthOutcome(timeoutMs = 25_000): Promise<void> {
-    const deadline = Date.now() + timeoutMs;
-    while (Date.now() < deadline) {
-      if (this.isInitialized || this.latestQrCode || this.latestPairingCode) return;
+    const start = Date.now();
+    const QR_GRACE_MS = 3_000; // Tolerate the just-scanned race before 'loading_screen' fires
+    while (Date.now() - start < timeoutMs) {
+      if (this.isInitialized) return;
+      const codePending = !!(this.latestQrCode || this.latestPairingCode);
+      // A pending code is a definitive outcome ("waiting for the user to
+      // scan") - but NOT while a scan is being processed (isAuthenticating),
+      // and only after a short grace period, so a status check made right
+      // after scanning waits for 'ready' instead of reporting a stale state.
+      if (codePending && !this.isAuthenticating && Date.now() - start >= QR_GRACE_MS) return;
       await new Promise((resolve) => setTimeout(resolve, 250));
     }
   }

@@ -12,7 +12,7 @@ export function registerChatTools(
 
   server.tool(
     'list_chats',
-    'Get WhatsApp chats, optionally filtered and sorted.',
+    'Get WhatsApp chats sorted by recent activity. Note: the "lastMessage" field is the newest event of ANY type (a call shows as type "call_log" with an empty body, media as "image"/"video", etc.) - NOT necessarily the last text message, and chat order reflects any activity, not just texts. To read actual conversation content, use list_messages.',
     {
       limit: z.number().int().positive().optional().default(20).describe('Maximum number of chats to return'),
       // Note: whatsapp-web.js doesn't directly support query filtering or pagination for getChats()

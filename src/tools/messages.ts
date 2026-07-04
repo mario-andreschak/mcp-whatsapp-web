@@ -13,7 +13,7 @@ export function registerMessageTools(
 
   server.tool(
     'list_messages',
-    'Get WhatsApp messages from a specific chat.',
+    'Get WhatsApp messages from a specific chat. This is the source of truth for actual message content: use it whenever the question is about what someone said/wrote. Entries include non-text events too (check the "type" field: "chat" = text message, "call_log" = call, "ptt" = voice note, "image"/"video" = media; non-text entries may have an empty "body").',
     {
       chat_id: z.string().describe('The JID of the chat to retrieve messages from (e.g., 123456789@c.us or 123456789-12345678@g.us)'),
       limit: z.number().int().positive().optional().default(50).describe('Maximum number of messages to return'),
@@ -117,7 +117,7 @@ export function registerMessageTools(
   // get_last_interaction is similar to list_chats with limit 1
   server.tool(
     'get_last_interaction',
-    'Get the most recent message involving a specific contact or group JID.',
+    'Get the most recent event involving a specific contact or group JID. IMPORTANT: this returns the newest event of ANY type - including call logs, media, and system notifications, which have an empty "body" - NOT necessarily the last text message. To read what was actually said, use list_messages instead.',
     {
       jid: z.string().describe('The JID of the contact or group (e.g., 123456789@c.us or 123456789-12345678@g.us)'),
     },
