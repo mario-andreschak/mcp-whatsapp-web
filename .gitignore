@@ -13,3 +13,6 @@ wheels/
 *.html
 /logs
 .env
+
+# OAuth client registrations and token hashes
+.oauth-store.json

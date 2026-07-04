@@ -18,7 +18,8 @@ With this MCP server, you can:
 - **WhatsApp Web Integration**: Uses [whatsapp-web.js](https://github.com/pedroslopez/whatsapp-web.js) for direct connection to WhatsApp Web
 - **MCP Server**: Implements the [Model Context Protocol](https://modelcontextprotocol.io/) for seamless integration with AI assistants
 - **Media Support**: Send and receive images, videos, documents, and audio messages
-- **Multiple Transport Options**: Supports both stdio and SSE transports for flexible integration
+- **Multiple Transport Options**: Supports stdio and Streamable HTTP transports — even both at once from a single process (start with stdio and set `MCP_HTTP_PORT` to additionally expose `http://127.0.0.1:<port>/mcp`, or run HTTP-only with `--http`)
+- **Flexible Authentication**: QR code (as an MCP image tool), pairing code (`request_pairing_code` tool, or automatically printed to stderr at startup via `WHATSAPP_PAIRING_PHONE_NUMBER`), and an optional OAuth flow for HTTP clients (`MCP_OAUTH=true`) where the browser authorization page shows the WhatsApp QR code — unlinking WhatsApp revokes tokens so clients automatically re-authenticate
 
 ## Architecture
 
@@ -30,10 +31,11 @@ This MCP server consists of:
 
 ## Prerequisites
 
-- Node.js >= 18.0.0
+- Node.js >= 20.0.0
 - npm or yarn
-- Chrome/Chromium (used by Puppeteer for WhatsApp Web connection)
-- FFmpeg (optional, for audio message conversion)
+- Google Chrome or Microsoft Edge (auto-detected; only needed for sending videos/GIFs — everything else works with the Chromium that puppeteer downloads automatically)
+
+FFmpeg is bundled automatically via the `ffmpeg-static` npm package — no manual installation needed. You can point the `FFMPEG_PATH` environment variable at your own binary to override it.
 
 ## Installation
 
@@ -66,7 +68,7 @@ This MCP server consists of:
    cp .env.example .env
    ```
 
-   You can adjust logging levels and specify paths to FFmpeg if needed.
+   You can adjust logging levels, pin the WhatsApp Web version, or override the auto-detected browser (`BROWSER_EXECUTABLE_PATH`) and ffmpeg binary (`FFMPEG_PATH`) if needed.
 
 ### Installation with FLUJO
 

@@ -1,85 +1,79 @@
 import { pino } from 'pino';
+import pretty from 'pino-pretty';
 import fs from 'fs';
 import path from 'path';
+import util from 'util';
 
-// Determine if we're in a browser environment
-const isBrowser = typeof globalThis !== 'undefined' && 
-                 typeof (globalThis as any).window !== 'undefined' && 
-                 typeof (globalThis as any).window.localStorage !== 'undefined';
+// stdio MCP servers must never write logs to stdout (it would corrupt the
+// JSON-RPC stream), but stderr is safe and is surfaced by most MCP clients.
+// We therefore log to two sinks:
+//   - logs/mcp-whatsapp.log : everything at LOG_LEVEL (default: info)
+//   - stderr                : LOG_STDERR_LEVEL and above (default: warn)
 
-// We're now always using the custom destination regardless of transport type
-// to ensure no logs go to stdout/stderr
+const VALID_LEVELS = ['trace', 'debug', 'info', 'warn', 'error', 'fatal'];
+const levelOrDefault = (value: string | undefined, fallback: string): string =>
+  value && VALID_LEVELS.includes(value) ? value : fallback;
+
+const LOG_LEVEL = levelOrDefault(process.env.LOG_LEVEL, 'info');
+const LOG_STDERR_LEVEL = levelOrDefault(process.env.LOG_STDERR_LEVEL, 'warn');
 
 // Create log directory if it doesn't exist
 const logDir = path.join(process.cwd(), 'logs');
-if (!isBrowser && !fs.existsSync(logDir)) {
-  try {
-    fs.mkdirSync(logDir, { recursive: true });
-  } catch (e) {
-    // Silent fail if directory creation fails
-  }
+try {
+  fs.mkdirSync(logDir, { recursive: true });
+} catch {
+  // Silent fail if directory creation fails; file stream below will also fail silently
 }
 
-// Define log file path
 const logFilePath = path.join(logDir, 'mcp-whatsapp.log');
 
-// Custom destination that writes to file or localStorage
-const customDestination = {
-  write: (msg: string) => {
-    if (isBrowser) {
-      // In browser, use localStorage with rotation to prevent overflow
-      try {
-        const storage = (globalThis as any).window.localStorage;
-        const key = 'mcp_whatsapp_log';
-        const existingLog = storage.getItem(key) || '';
-        // Keep only last 100KB to prevent localStorage overflow
-        const maxSize = 100 * 1024; 
-        const newLog = existingLog.length > maxSize 
-          ? existingLog.substring(existingLog.length - maxSize / 2) + msg
-          : existingLog + msg;
-        storage.setItem(key, newLog);
-      } catch (e) {
-        // Silent fail if localStorage is not available
-      }
-    } else {
-      // In Node.js, write to file
-      try {
-        fs.appendFileSync(logFilePath, msg);
-      } catch (e) {
-        // Silent fail if file write fails
-      }
-    }
-    return true;
-  }
-};
+const streams: pino.StreamEntry[] = [];
 
-// Configure pino logger
+try {
+  streams.push({
+    level: LOG_LEVEL as pino.Level,
+    stream: pino.destination({ dest: logFilePath, append: true, sync: false }),
+  });
+} catch {
+  // File logging unavailable; stderr stream still works
+}
+
+streams.push({
+  level: LOG_STDERR_LEVEL as pino.Level,
+  stream: pretty({
+    destination: 2, // stderr
+    colorize: false,
+    translateTime: 'SYS:standard',
+    ignore: 'pid,hostname',
+  }),
+});
+
 export const log = pino(
   {
-    level: process.env.LOG_LEVEL || 'info',
+    // The logger level must be the lowest of all stream levels,
+    // otherwise streams with a lower threshold never receive anything.
+    level: 'trace',
+    hooks: {
+      // The codebase logs console-style: log.error('Something failed:', error).
+      // Vanilla pino would silently DROP every argument after the first, losing
+      // the actual error message and stack. Merge all arguments into the log
+      // line instead (util.format renders Error objects with their stack).
+      logMethod(inputArgs, method) {
+        if (inputArgs.length >= 2) {
+          return method.call(this, util.format(...inputArgs));
+        }
+        return method.apply(this, inputArgs);
+      },
+    },
   },
-  // Pass the custom destination as the second parameter
-  customDestination
+  pino.multistream(streams),
 );
 
 // Add a method to retrieve logs (useful for debugging)
 export const getLogs = (): string => {
-  if (isBrowser) {
-    return (globalThis as any).window.localStorage.getItem('mcp_whatsapp_log') || '';
-  } else {
-    try {
-      return fs.existsSync(logFilePath) 
-        ? fs.readFileSync(logFilePath, 'utf8')
-        : '';
-    } catch (e) {
-      return '';
-    }
+  try {
+    return fs.existsSync(logFilePath) ? fs.readFileSync(logFilePath, 'utf8') : '';
+  } catch {
+    return '';
   }
 };
-
-// Example usage:
-// log.info('This is an info message');
-// log.warn('This is a warning');
-// log.error(new Error('Something went wrong'), 'Error details');
-// log.debug({ data: { key: 'value' } }, 'Debugging data');
-// log.verbose('Verbose message', JSON.stringify({ complex: { nested: true } }));

@@ -1,5 +1,6 @@
 import { WhatsAppService } from '../services/whatsapp.js';
 import qrcode from 'qrcode';
+import { z } from 'zod';
 import { log } from '../utils/logger.js';
 import { CallToolResult } from '@modelcontextprotocol/sdk/types.js';
 import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
@@ -25,6 +26,21 @@ export function registerAuthTools(
   );
 
   server.tool(
+    'request_pairing_code',
+    'Request a pairing code as a text-based alternative to scanning the QR code. The user enters the returned 8-character code on their phone under Settings > Linked Devices > Link a device > "Link with phone number instead".',
+    {
+      phone_number: z
+        .string()
+        .describe(
+          'The WhatsApp phone number to link, in international symbol-free format (e.g. 4915112345678 for Germany, 12025550108 for US)',
+        ),
+    },
+    async ({ phone_number }): Promise<CallToolResult> => {
+      return await requestPairingCode(whatsappService, phone_number);
+    }
+  );
+
+  server.tool(
     'check_auth_status',
     'Check if the WhatsApp client is authenticated and connected',
     {},
@@ -43,6 +59,61 @@ export function registerAuthTools(
   );
 
   log.info('Authentication tools registered.');
+}
+
+/**
+ * Tool to request a pairing code for phone-number-based authentication
+ * @param whatsappService The WhatsApp service instance
+ * @param phoneNumber The phone number to link, international symbol-free format
+ * @returns A promise that resolves to the tool result containing the pairing code
+ */
+async function requestPairingCode(
+  whatsappService: WhatsAppService,
+  phoneNumber: string
+): Promise<CallToolResult> {
+  try {
+    if (whatsappService.isAuthenticated()) {
+      return {
+        content: [
+          {
+            type: 'text',
+            text: 'You are already authenticated with WhatsApp. No pairing code is needed.'
+          }
+        ],
+        isError: false
+      };
+    }
+
+    const code = await whatsappService.requestPairingCode(phoneNumber);
+
+    log.info('Pairing code generated successfully');
+
+    return {
+      content: [
+        {
+          type: 'text',
+          text:
+            `Pairing code: ${code}\n\n` +
+            'Enter this code on the phone with the WhatsApp account:\n' +
+            'Settings > Linked Devices > Link a device > "Link with phone number instead".\n' +
+            'The code expires after a few minutes; request a new one if it does. ' +
+            'Use check_auth_status to verify the connection afterwards.'
+        }
+      ],
+      isError: false
+    };
+  } catch (error) {
+    log.error('Error requesting pairing code:', error);
+    return {
+      content: [
+        {
+          type: 'text',
+          text: `Error requesting pairing code: ${error instanceof Error ? error.message : String(error)}`
+        }
+      ],
+      isError: true
+    };
+  }
 }
 
 /**
@@ -107,18 +178,25 @@ async function checkAuthStatus(
 ): Promise<CallToolResult> {
   try {
     const isAuthenticated = whatsappService.isAuthenticated();
-    
+    const pairingCode = whatsappService.getLatestPairingCode();
+
     log.info(`Authentication status checked: ${isAuthenticated ? 'authenticated' : 'not authenticated'}`);
-    
+
+    let text: string;
+    if (isAuthenticated) {
+      text = 'You are currently authenticated with WhatsApp and ready to use all features.';
+    } else if (pairingCode) {
+      text =
+        `You are not currently authenticated with WhatsApp. An active pairing code is available: ${pairingCode}\n` +
+        'Enter it on the phone under Settings > Linked Devices > Link a device > "Link with phone number instead". ' +
+        'A fresh code is generated every ~3 minutes.';
+    } else {
+      text =
+        'You are not currently authenticated with WhatsApp. Please use the get_qr_code tool (or request_pairing_code) to authenticate.';
+    }
+
     return {
-      content: [
-        {
-          type: 'text',
-          text: isAuthenticated 
-            ? 'You are currently authenticated with WhatsApp and ready to use all features.' 
-            : 'You are not currently authenticated with WhatsApp. Please use the get_qr_code tool to authenticate.'
-        }
-      ],
+      content: [{ type: 'text', text }],
       isError: false
     };
   } catch (error) {

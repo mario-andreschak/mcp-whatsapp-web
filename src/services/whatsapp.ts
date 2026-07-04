@@ -15,6 +15,7 @@ import type WAWebJS from 'whatsapp-web.js';
 import { log } from '../utils/logger.js';
 import path from 'path';
 import { BrowserProcessManager } from '../utils/browser-process-manager.js';
+import { findBrowserExecutable } from '../utils/browser-finder.js';
 
 // Define custom types or interfaces if needed, mapping from whatsapp-web.js types
 // For now, we'll use whatsapp-web.js types directly where possible,
@@ -58,14 +59,23 @@ export class WhatsAppService {
   private client: WAWebJS.Client;
   private isInitialized = false;
   private latestQrCode: string | null = null; // Added to store QR code
+  private latestPairingCode: string | null = null; // Set when phone number pairing is active
   private browserProcessManager: BrowserProcessManager;
-  // private dbService?: any; // Placeholder for optional DB service - Commented out
+  private reconnectAttempts = 0;
+  private reconnectTimer: NodeJS.Timeout | null = null;
+  private healthCheckTimer: NodeJS.Timeout | null = null;
+  private suppressReconnect = false; // Set during intentional shutdown/logout
+  // Notified when the WhatsApp session itself becomes invalid (logout or
+  // authentication failure) - used e.g. to revoke OAuth tokens.
+  private sessionInvalidatedListeners: Array<() => void> = [];
 
-  constructor(/* dbService?: any */ /* Replace 'any' with actual DB service type */) {
-    // this.dbService = dbService; // Commented out
+  constructor() {
     this.browserProcessManager = new BrowserProcessManager();
+    this.client = this.createClient();
+  }
 
-    const clientOptions: WAWebJS.ClientOptions = {
+  private buildClientOptions(): WAWebJS.ClientOptions {
+    return {
       authStrategy: new LocalAuth({
         dataPath: path.join(process.cwd(), 'whatsapp-sessions'), // Store sessions in project root
       }),
@@ -81,73 +91,202 @@ export class WhatsAppService {
           // '--single-process', // Might be needed on some systems
           '--disable-gpu',
         ],
-        // Use Chrome executable path from environment variable if available
-        // This is needed for video/gif sending as Chromium (default) doesn't support H.264/AAC codecs
-        ...(process.env.CHROME_EXECUTABLE_PATH && {
-          executablePath: process.env.CHROME_EXECUTABLE_PATH
-        })
-       },
-       // qrTimeout option removed as it's not valid in whatsapp-web.js v1.23+
-     };
-
-     this.client = new Client(clientOptions);
-
-    this.setupEventHandlers();
+        // Chrome/Edge is needed for video/gif sending, as the Chromium bundled
+        // with puppeteer doesn't support H.264/AAC codecs.
+        ...(() => {
+          const executablePath = findBrowserExecutable();
+          return executablePath ? { executablePath } : {};
+        })(),
+      },
+      // Opt-in phone number pairing: when set, the client requests a pairing
+      // code instead of relying on the QR code. The code is surfaced via the
+      // 'code' event (logged to stderr) and regenerated automatically every
+      // ~3 minutes until pairing succeeds.
+      ...(process.env.WHATSAPP_PAIRING_PHONE_NUMBER && {
+        pairWithPhoneNumber: {
+          phoneNumber: process.env.WHATSAPP_PAIRING_PHONE_NUMBER.replace(/\D/g, ''),
+          showNotification: true,
+        },
+      }),
+      // Optionally pin the WhatsApp Web version to protect against
+      // breaking changes rolled out by WhatsApp (e.g. WA_WEB_VERSION=2.3000.1015010992)
+      ...(process.env.WA_WEB_VERSION && {
+        webVersionCache: {
+          type: 'remote' as const,
+          remotePath: `https://raw.githubusercontent.com/wppconnect-team/wa-version/main/html/${process.env.WA_WEB_VERSION}.html`,
+        },
+      }),
+    };
   }
 
-  private setupEventHandlers(): void {
-    this.client.on('qr', (qr: string) => {
+  private createClient(): WAWebJS.Client {
+    const client = new Client(this.buildClientOptions());
+    this.setupEventHandlers(client);
+    return client;
+  }
+
+  private setupEventHandlers(client: WAWebJS.Client): void {
+    client.on('qr', (qr: string) => {
       log.info('QR code received.');
       this.latestQrCode = qr; // Store the QR code
-      // qrcodeTerminal.generate(qr, { small: true }); // Removed console logging
     });
 
-    this.client.on('authenticated', () => { // No type needed for msg here
+    // Fired when WHATSAPP_PAIRING_PHONE_NUMBER is configured. Written directly
+    // to stderr, bypassing the logger and its level configuration: the pairing
+    // code must always surface in the MCP client's server logs (FLUJO, Claude,
+    // Cline, ...) so the user can complete authentication. stderr never
+    // interferes with the MCP protocol, which uses stdout only.
+    client.on('code', (code: string) => {
+      this.latestPairingCode = code;
+      process.stderr.write(
+        '\n' +
+          '========================================================\n' +
+          `  WhatsApp pairing code: ${code}\n` +
+          `  On the phone with number ${process.env.WHATSAPP_PAIRING_PHONE_NUMBER}:\n` +
+          '  Settings > Linked Devices > Link a device\n' +
+          '  > "Link with phone number instead" - enter the code.\n' +
+          '  A fresh code is generated every ~3 minutes.\n' +
+          '========================================================\n\n',
+      );
+      log.info(`WhatsApp pairing code received: ${code}`);
+    });
+
+    client.on('authenticated', () => {
       log.info('WhatsApp client authenticated.');
       this.latestQrCode = null; // Clear QR code once authenticated
+      this.latestPairingCode = null;
     });
 
-    this.client.on('auth_failure', (msg: string) => { // Add type string
+    client.on('auth_failure', (msg: string) => {
       log.error('WhatsApp authentication failure:', msg);
-      // Potentially exit or attempt re-authentication
+      this.isInitialized = false;
+      this.latestQrCode = null;
+      this.notifySessionInvalidated();
+      // Restart the client so a fresh QR code is emitted and
+      // get_qr_code works again without a server restart.
+      this.scheduleReconnect(`authentication failure: ${msg}`);
     });
 
-    this.client.on('ready', () => {
+    client.on('ready', () => {
       log.info('WhatsApp client is ready.');
       this.isInitialized = true;
-      // Perform actions after client is ready, e.g., fetch initial chats/contacts
+      this.reconnectAttempts = 0;
+      this.startHealthCheck();
     });
 
-    this.client.on('message', async (message: WAWebJS.Message) => {
+    client.on('message', async (message: WAWebJS.Message) => {
       log.debug('Received message:', JSON.stringify(message));
-      // Handle incoming messages - potentially store in DB if dbService is configured
-      // if (this.dbService) {
-      //   await this.dbService.storeMessage(this.mapMessageToSimpleMessage(message));
-      // }
     });
 
-    this.client.on('message_create', async (message: WAWebJS.Message) => {
+    client.on('message_create', async (message: WAWebJS.Message) => {
       // Fired on all message creations, including your own
       if (message.fromMe) {
         log.debug('Sent message:', JSON.stringify(message));
-        // Handle outgoing messages - potentially store in DB
-        // if (this.dbService) {
-        //   await this.dbService.storeMessage(this.mapMessageToSimpleMessage(message));
-        // }
       }
     });
 
-    this.client.on('disconnected', (reason: any) => { // Use any for reason for now
+    client.on('disconnected', (reason: any) => {
       log.warn('WhatsApp client disconnected:', reason);
       this.isInitialized = false;
-      // Handle disconnection, maybe attempt to reconnect
-      // this.initialize().catch(err => log.error('Reconnection failed:', err));
       this.latestQrCode = null; // Clear QR on disconnect
+      this.latestPairingCode = null;
+      this.scheduleReconnect(`disconnected: ${reason}`);
     });
 
-    this.client.on('loading_screen', (percent: number, message: string) => { // Add types
-        log.info(`WhatsApp loading: ${percent}% - ${message}`);
+    client.on('loading_screen', (percent: number, message: string) => {
+      log.info(`WhatsApp loading: ${percent}% - ${message}`);
     });
+  }
+
+  /**
+   * Schedule a reconnect attempt with exponential backoff (5s, 10s, 20s, ...
+   * capped at 5 minutes). No-op if a reconnect is already pending or the
+   * disconnect was intentional (shutdown/logout).
+   */
+  private scheduleReconnect(reason: string): void {
+    if (this.suppressReconnect || this.reconnectTimer) {
+      return;
+    }
+    const delayMs = Math.min(5000 * 2 ** this.reconnectAttempts, 5 * 60 * 1000);
+    this.reconnectAttempts++;
+    log.warn(
+      `WhatsApp connection lost (${reason}). Reconnect attempt ${this.reconnectAttempts} scheduled in ${Math.round(delayMs / 1000)}s.`,
+    );
+    this.reconnectTimer = setTimeout(() => {
+      this.reconnectTimer = null;
+      void this.reconnect();
+    }, delayMs);
+    // Don't let a pending reconnect keep the process alive during shutdown
+    this.reconnectTimer.unref?.();
+  }
+
+  private async reconnect(): Promise<void> {
+    if (this.suppressReconnect) {
+      return;
+    }
+    log.info('Attempting to reconnect WhatsApp client...');
+    this.stopHealthCheck();
+    try {
+      await this.client.destroy();
+    } catch (error) {
+      log.warn('Error destroying client during reconnect (continuing):', error);
+    }
+    this.isInitialized = false;
+    try {
+      // Recreate the client: re-initializing a destroyed client instance is unreliable
+      this.client = this.createClient();
+      await this.initialize();
+      log.info('WhatsApp client reconnected successfully.');
+    } catch (error) {
+      log.error('Reconnect attempt failed:', error);
+      this.scheduleReconnect('previous reconnect attempt failed');
+    }
+  }
+
+  /**
+   * Periodically verify the client is still connected. Some failure modes
+   * (e.g. the phone going offline for a long time, browser tab dying) do not
+   * reliably emit a 'disconnected' event.
+   */
+  private startHealthCheck(): void {
+    this.stopHealthCheck();
+    const intervalMs = Number(process.env.HEALTH_CHECK_INTERVAL_MS || 60_000);
+    if (intervalMs <= 0) {
+      log.info('Health check disabled (HEALTH_CHECK_INTERVAL_MS <= 0).');
+      return;
+    }
+    this.healthCheckTimer = setInterval(async () => {
+      try {
+        const state = await this.client.getState();
+        if (state !== 'CONNECTED') {
+          log.warn(`Health check: client state is '${state ?? 'unknown'}', triggering reconnect.`);
+          this.isInitialized = false;
+          this.stopHealthCheck();
+          this.scheduleReconnect(`health check state: ${state}`);
+        }
+      } catch (error) {
+        log.warn('Health check: failed to get client state, triggering reconnect.', error);
+        this.isInitialized = false;
+        this.stopHealthCheck();
+        this.scheduleReconnect('health check error');
+      }
+    }, intervalMs);
+    // Don't keep the process alive just for health checks
+    this.healthCheckTimer.unref?.();
+  }
+
+  private stopHealthCheck(): void {
+    if (this.healthCheckTimer) {
+      clearInterval(this.healthCheckTimer);
+      this.healthCheckTimer = null;
+    }
+  }
+
+  private cancelPendingReconnect(): void {
+    if (this.reconnectTimer) {
+      clearTimeout(this.reconnectTimer);
+      this.reconnectTimer = null;
+    }
   }
 
   async initialize(): Promise<void> {
@@ -155,14 +294,17 @@ export class WhatsAppService {
       log.warn('WhatsApp client already initialized.');
       return;
     }
-    
+
+    // Re-enable auto-reconnect (it is suppressed during logout/shutdown)
+    this.suppressReconnect = false;
+
     // Clean up any orphaned browser processes before starting
     await this.browserProcessManager.cleanupOrphanedProcesses();
-    
+
     log.info('Initializing WhatsApp client...');
     try {
       await this.client.initialize();
-      
+
       // Register the browser process
       const pid = await this.getBrowserPid();
       if (pid) {
@@ -179,6 +321,9 @@ export class WhatsAppService {
 
   async destroy(): Promise<void> {
     log.info('Destroying WhatsApp client...');
+    this.suppressReconnect = true;
+    this.cancelPendingReconnect();
+    this.stopHealthCheck();
     try {
       // Get the PID before destroying the client
       const pid = await this.getBrowserPid();
@@ -208,21 +353,34 @@ export class WhatsAppService {
 
   async logout(): Promise<void> {
     log.info('Logging out of WhatsApp...');
+    this.suppressReconnect = true; // The logout will emit 'disconnected'; don't auto-reconnect
+    this.cancelPendingReconnect();
+    this.stopHealthCheck();
     try {
       // Get the PID before logging out
       const pid = await this.getBrowserPid();
-      
+
       // Logout from WhatsApp
       await this.client.logout();
       this.isInitialized = false;
       this.latestQrCode = null;
       log.info('Successfully logged out of WhatsApp');
-      
+      this.notifySessionInvalidated();
+
       // Unregister the browser process
       if (pid) {
         this.browserProcessManager.unregisterProcess(pid);
         log.info(`Unregistered browser process with PID: ${pid}`);
       }
+
+      // Tear down and recreate the client so the next initialize() starts
+      // from a clean state and emits a fresh QR code.
+      try {
+        await this.client.destroy();
+      } catch (destroyError) {
+        log.warn('Error destroying client after logout (continuing):', destroyError);
+      }
+      this.client = this.createClient();
     } catch (error) {
       log.error('Error logging out of WhatsApp:', error);
       throw error;
@@ -239,6 +397,55 @@ export class WhatsAppService {
 
   getLatestQrCode(): string | null {
     return this.latestQrCode;
+  }
+
+  /** Latest pairing code emitted while phone number pairing is active, if any. */
+  getLatestPairingCode(): string | null {
+    return this.latestPairingCode;
+  }
+
+  /** Register a listener fired when the WhatsApp session is unlinked or fails to authenticate. */
+  onSessionInvalidated(listener: () => void): void {
+    this.sessionInvalidatedListeners.push(listener);
+  }
+
+  private notifySessionInvalidated(): void {
+    for (const listener of this.sessionInvalidatedListeners) {
+      try {
+        listener();
+      } catch (error) {
+        log.warn('Session-invalidated listener failed:', error);
+      }
+    }
+  }
+
+  /**
+   * Request a pairing code as an alternative to scanning the QR code.
+   * The user enters the returned 8-character code on their phone under
+   * Settings > Linked Devices > Link a device > "Link with phone number instead".
+   *
+   * Only valid while the client is unauthenticated and waiting at the QR stage.
+   *
+   * @param phoneNumber Phone number in international, symbol-free format
+   *                    (e.g. 4915112345678 for Germany, 12025550108 for US).
+   */
+  async requestPairingCode(phoneNumber: string): Promise<string> {
+    if (this.isAuthenticated()) {
+      throw new Error('Client is already authenticated; no pairing code needed.');
+    }
+    const sanitized = phoneNumber.replace(/\D/g, '');
+    if (sanitized.length < 6) {
+      throw new Error(
+        `Invalid phone number '${phoneNumber}'. Provide it in international, symbol-free format (e.g. 4915112345678).`,
+      );
+    }
+    if (!this.latestQrCode) {
+      throw new Error(
+        'The client is not at the pairing stage yet (no QR code has been emitted). Try again in a few seconds.',
+      );
+    }
+    log.info(`Requesting pairing code for phone number ${sanitized}...`);
+    return this.client.requestPairingCode(sanitized, true);
   }
 
   isAuthenticated(): boolean {

@@ -1,25 +1,26 @@
 import ffmpeg from 'fluent-ffmpeg';
+import { createRequire } from 'module';
 import fs from 'fs';
 import path from 'path';
 import os from 'os';
 import { log } from './logger.js';
 
-// Attempt to find ffmpeg path automatically or allow setting via environment variable
-const FFMPEG_PATH = process.env.FFMPEG_PATH || findFfmpegPath();
+// ffmpeg-static is CommonJS (module.exports = <path string>), so load it via
+// require to get correct typings under NodeNext module resolution.
+const require = createRequire(import.meta.url);
+const ffmpegStatic = require('ffmpeg-static') as string | null;
+
+// Resolution order: FFMPEG_PATH env var (manual override) -> binary bundled
+// by ffmpeg-static (installed automatically with npm install) -> system PATH.
+const FFMPEG_PATH = process.env.FFMPEG_PATH || ffmpegStatic || null;
 if (FFMPEG_PATH) {
   ffmpeg.setFfmpegPath(FFMPEG_PATH);
-  log.info(`Using ffmpeg found at: ${FFMPEG_PATH}`);
+  // Expose the resolved path so fluent-ffmpeg usages inside whatsapp-web.js
+  // (video/sticker conversion) pick up the same binary.
+  process.env.FFMPEG_PATH = FFMPEG_PATH;
+  log.info(`Using ffmpeg at: ${FFMPEG_PATH}`);
 } else {
-  log.warn('ffmpeg path not found or set. Audio conversion will likely fail. Set FFMPEG_PATH environment variable if needed.');
-}
-
-function findFfmpegPath(): string | null {
-    // Basic check in common locations or PATH (this is simplified)
-    // A more robust solution might use 'which' or 'where' commands
-    // or check standard installation directories per OS.
-    // For now, we rely on it being in the system PATH or set via env var.
-    // Returning null signifies it wasn't explicitly found here.
-    return null;
+  log.warn('No ffmpeg binary found. Audio conversion will rely on ffmpeg being in the system PATH.');
 }
 
 export class AudioUtils {
@@ -40,12 +41,6 @@ export class AudioUtils {
     sampleRate = 24000,
   ): Promise<string> {
     return new Promise((resolve, reject) => {
-      if (!FFMPEG_PATH && !process.env.FFMPEG_PATH) {
-         // Check again in case it became available after startup
-         if (!findFfmpegPath()) {
-            return reject(new Error('ffmpeg path not configured. Set FFMPEG_PATH or ensure ffmpeg is in system PATH.'));
-         }
-      }
       if (!fs.existsSync(inputPath)) {
         return reject(new Error(`Input file not found: ${inputPath}`));
       }

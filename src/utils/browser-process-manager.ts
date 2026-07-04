@@ -130,7 +130,7 @@ export class BrowserProcessManager {
         await execAsync(`ps -p ${pid} -o pid=`);
         return true;
       }
-    } catch (error) {
+    } catch {
       // Process not found
       return false;
     }

@@ -1,24 +1,16 @@
 // Load environment variables from .env file
 import 'dotenv/config';
+import util from 'util';
 
-// At the very top of src/index.ts, before any imports
-if (process.argv.includes('--stdio') || 
-    (!process.argv.includes('--sse') && process.env.TRANSPORT !== 'sse')) {
-  // Redirect stdout and stderr to prevent breaking MCP protocol
-  
-  // // Silently discard all stdout writes
-  // process.stdout.write = function(): boolean {
-  //   return true; // Pretend it succeeded but don't actually write
-  // };
-  
-  // // Silently discard all stderr writes
-  // process.stderr.write = function(): boolean {
-  //   return true; // Pretend it succeeded but don't actually write
-  // };
-  
-  // Also silence console methods
-  const noop = () => {};
-  console.log = console.info = console.debug = console.warn = console.error = noop;
+// With the stdio transport, stdout carries the MCP JSON-RPC stream, so nothing
+// else may ever write to it. Redirect all console output (including from
+// third-party libraries) to stderr, which MCP clients surface as server logs.
+// This is done unconditionally: it is equally correct for the HTTP transport.
+{
+  const toStderr = (...args: unknown[]): void => {
+    process.stderr.write(util.format(...args) + '\n');
+  };
+  console.log = console.info = console.debug = console.warn = console.error = toStderr;
 }
 
 import { WhatsAppMcpServer } from './server.js';
@@ -110,9 +102,20 @@ async function main() {
 
   serverInstance = new WhatsAppMcpServer();
 
-  // Determine transport from command line arguments or environment variables
-  // For now, defaulting to stdio
-  const transportType = process.argv.includes('--sse') ? 'sse' : 'stdio';
+  // Determine transport from command line arguments or environment variables.
+  // Default: stdio. '--http' (or TRANSPORT=http) serves Streamable HTTP.
+  // '--sse' / TRANSPORT=sse are accepted as deprecated aliases for http.
+  const wantsHttp =
+    process.argv.includes('--http') ||
+    process.argv.includes('--sse') ||
+    process.env.TRANSPORT === 'http' ||
+    process.env.TRANSPORT === 'sse';
+  if (process.argv.includes('--sse') || process.env.TRANSPORT === 'sse') {
+    log.warn(
+      "The SSE transport has been replaced by Streamable HTTP; '--sse' now starts the Streamable HTTP transport (endpoint: /mcp).",
+    );
+  }
+  const transportType = wantsHttp ? ('http' as const) : ('stdio' as const);
 
   try {
     await serverInstance.start(transportType);

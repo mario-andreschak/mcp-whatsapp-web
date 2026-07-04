@@ -1,9 +1,17 @@
 import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js';
-import { SSEServerTransport } from '@modelcontextprotocol/sdk/server/sse.js';
-import { Implementation } from '@modelcontextprotocol/sdk/types.js';
-import express, { Request, Response } from 'express'; // Import Request and Response
-// import { z } from 'zod'; // z is unused currently
+import { StreamableHTTPServerTransport } from '@modelcontextprotocol/sdk/server/streamableHttp.js';
+import { Implementation, isInitializeRequest } from '@modelcontextprotocol/sdk/types.js';
+import {
+  mcpAuthRouter,
+  getOAuthProtectedResourceMetadataUrl,
+} from '@modelcontextprotocol/sdk/server/auth/router.js';
+import { requireBearerAuth } from '@modelcontextprotocol/sdk/server/auth/middleware/bearerAuth.js';
+import { randomUUID } from 'node:crypto';
+import express, { Request, Response, RequestHandler } from 'express';
+import path from 'path';
+import { WhatsAppOAuthProvider } from './auth/oauth-provider.js';
+import { createLinkRouter } from './auth/link-page.js';
 import { WhatsAppService } from './services/whatsapp.js';
 import { log } from './utils/logger.js';
 import { BrowserProcessManager } from './utils/browser-process-manager.js';
@@ -16,82 +24,217 @@ import { registerAuthTools } from './tools/auth.js';
 
 const SERVER_INFO: Implementation = {
   name: 'mcp-whatsapp-web',
-  version: '1.0.0', // Consider reading from package.json
+  version: '1.1.0', // Keep in sync with package.json
 };
 
+export type TransportType = 'stdio' | 'http';
+
 export class WhatsAppMcpServer {
-  public readonly server: McpServer;
   private readonly whatsapp: WhatsAppService;
-  private sseTransports: { [sessionId: string]: SSEServerTransport } = {};
   private browserProcessManager: BrowserProcessManager;
+  // One transport (each with its own McpServer facade) per Streamable HTTP session.
+  // They all share the single WhatsAppService instance and thus the same WhatsApp session.
+  private httpTransports: { [sessionId: string]: StreamableHTTPServerTransport } = {};
+  private httpServer: ReturnType<express.Express['listen']> | null = null;
 
   constructor() {
     this.browserProcessManager = new BrowserProcessManager();
     this.whatsapp = new WhatsAppService();
+  }
 
-    this.server = new McpServer(SERVER_INFO, {
-      // Define initial capabilities if needed
+  /**
+   * Build an McpServer with all tools registered. Stdio uses a single
+   * instance; Streamable HTTP creates one per session (an McpServer can only
+   * be bound to one transport at a time).
+   */
+  private createServer(): McpServer {
+    const server = new McpServer(SERVER_INFO, {
       capabilities: {
-        // Example: Enable logging capability
         logging: {},
       },
       instructions: 'This server provides tools to interact with WhatsApp.',
     });
 
-    this.registerTools();
-  }
+    registerAuthTools(server, this.whatsapp);
+    registerContactTools(server, this.whatsapp);
+    registerChatTools(server, this.whatsapp);
+    registerMessageTools(server, this.whatsapp);
+    registerMediaTools(server, this.whatsapp);
 
-  private registerTools() {
-    log.info('Registering MCP tools...');
-    // Call tool registration functions here
-    registerAuthTools(this.server, this.whatsapp);
-    registerContactTools(this.server, this.whatsapp);
-    registerChatTools(this.server, this.whatsapp);
-    registerMessageTools(this.server, this.whatsapp);
-    registerMediaTools(this.server, this.whatsapp);
-
-    // Remove example dummy tool if no longer needed, or keep for testing
-    // this.server.tool('ping', async () => ({
-    //   content: [{ type: 'text', text: 'pong' }],
-    // }));
-    // Let's keep ping for now for basic testing
-    this.server.tool('ping', async () => ({
+    server.tool('ping', async () => ({
       content: [{ type: 'text', text: 'pong' }],
     }));
 
-    log.info('MCP tools registered.');
+    return server;
   }
 
-  async start(transportType: 'stdio' | 'sse' = 'stdio') {
-    log.info(`Initializing WhatsApp client...`);
-    try {
-      // Clean up any orphaned browser processes before starting
-      await this.browserProcessManager.cleanupOrphanedProcesses();
-      
-      // Initialize the WhatsApp client
-      await this.whatsapp.initialize();
-      log.info('WhatsApp client initialized successfully.');
-    } catch (error) {
-      log.error('Failed to initialize WhatsApp client:', error);
-      throw error; // Rethrow to prevent server start
-    }
-
+  async start(transportType: TransportType = 'stdio') {
+    // Connect the MCP transport first so the server is responsive immediately.
+    // The WhatsApp client (browser launch, QR/session restore) initializes in
+    // the background; tools report a clear error until it is ready, and
+    // get_qr_code becomes usable as soon as a QR code is emitted.
     if (transportType === 'stdio') {
       await this.startStdioTransport();
+      // Optionally expose the Streamable HTTP endpoint alongside stdio
+      const extraHttpPort = Number(process.env.MCP_HTTP_PORT || 0);
+      if (extraHttpPort > 0) {
+        await this.startHttpTransport(extraHttpPort);
+      }
     } else {
-      await this.startSseTransport();
+      await this.startHttpTransport(Number(process.env.MCP_HTTP_PORT || 3001));
     }
+
+    log.info('Initializing WhatsApp client in the background...');
+    void (async () => {
+      try {
+        // Clean up any orphaned browser processes before starting
+        await this.browserProcessManager.cleanupOrphanedProcesses();
+
+        // Initialize the WhatsApp client
+        await this.whatsapp.initialize();
+        log.info('WhatsApp client initialized successfully.');
+      } catch (error) {
+        log.error(
+          'Failed to initialize WhatsApp client. The MCP server stays up; ' +
+            'check_auth_status and get_qr_code can be used once the issue is resolved.',
+          error,
+        );
+      }
+    })();
   }
 
   private async startStdioTransport() {
     log.info('Starting MCP server with stdio transport...');
     const stdioTransport = new StdioServerTransport();
-    // Handle transport errors
     stdioTransport.onerror = (error) => {
       log.error('StdioTransport Error:', error);
     };
-    await this.server.connect(stdioTransport);
+    await this.createServer().connect(stdioTransport);
     log.info('MCP server connected via stdio.');
+  }
+
+  /**
+   * Streamable HTTP transport (MCP spec 2025-03-26). Clients POST JSON-RPC to
+   * /mcp; the first initialize request opens a session identified by the
+   * mcp-session-id header. GET /mcp opens the optional server-to-client SSE
+   * stream, DELETE /mcp terminates the session.
+   */
+  private async startHttpTransport(port: number) {
+    log.info(`Starting MCP server with Streamable HTTP transport on port ${port}...`);
+    const app = express();
+    app.use(express.json({ limit: '10mb' }));
+
+    // Bind to localhost only by default: the endpoint exposes a personal
+    // WhatsApp session. Enable MCP_OAUTH=true to require OAuth bearer tokens.
+    const host = process.env.MCP_HTTP_HOST || '127.0.0.1';
+
+    // Optional OAuth layer: the server acts as its own authorization server,
+    // and the "consent screen" is the WhatsApp QR / pairing-code page.
+    const guards: RequestHandler[] = [];
+    if (process.env.MCP_OAUTH === 'true') {
+      const issuerUrl = new URL(`http://${host === '0.0.0.0' ? '127.0.0.1' : host}:${port}`);
+      const mcpUrl = new URL('/mcp', issuerUrl);
+      const provider = new WhatsAppOAuthProvider(
+        this.whatsapp,
+        path.join(process.cwd(), '.oauth-store.json'),
+      );
+      // Unlinking WhatsApp (logout / auth failure) revokes all tokens, so
+      // clients get a 401 and automatically re-run the browser flow.
+      this.whatsapp.onSessionInvalidated(() => provider.revokeAllTokens());
+
+      app.use(
+        mcpAuthRouter({
+          provider,
+          issuerUrl,
+          resourceServerUrl: mcpUrl,
+          resourceName: 'WhatsApp MCP Server',
+        }),
+      );
+      app.use('/oauth/link', createLinkRouter(provider, this.whatsapp));
+      guards.push(
+        requireBearerAuth({
+          verifier: provider,
+          resourceMetadataUrl: getOAuthProtectedResourceMetadataUrl(mcpUrl),
+        }),
+      );
+      log.info('OAuth authorization enabled: /mcp requires a bearer token.');
+    }
+
+    app.post('/mcp', ...guards, async (req: Request, res: Response) => {
+      const sessionId = req.headers['mcp-session-id'] as string | undefined;
+
+      try {
+        let transport: StreamableHTTPServerTransport;
+
+        if (sessionId && this.httpTransports[sessionId]) {
+          transport = this.httpTransports[sessionId];
+        } else if (!sessionId && isInitializeRequest(req.body)) {
+          transport = new StreamableHTTPServerTransport({
+            sessionIdGenerator: () => randomUUID(),
+            onsessioninitialized: (sid: string) => {
+              log.info(`Streamable HTTP session initialized: ${sid}`);
+              this.httpTransports[sid] = transport;
+            },
+          });
+          transport.onclose = () => {
+            if (transport.sessionId && this.httpTransports[transport.sessionId]) {
+              log.info(`Streamable HTTP session closed: ${transport.sessionId}`);
+              delete this.httpTransports[transport.sessionId];
+            }
+          };
+          await this.createServer().connect(transport);
+        } else {
+          res.status(400).json({
+            jsonrpc: '2.0',
+            error: { code: -32000, message: 'Bad Request: no valid session ID provided' },
+            id: null,
+          });
+          return;
+        }
+
+        await transport.handleRequest(req, res, req.body);
+      } catch (error) {
+        log.error('Error handling MCP HTTP request:', error);
+        if (!res.headersSent) {
+          res.status(500).json({
+            jsonrpc: '2.0',
+            error: { code: -32603, message: 'Internal server error' },
+            id: null,
+          });
+        }
+      }
+    });
+
+    // GET (SSE notification stream) and DELETE (session termination) share the same lookup
+    const handleSessionRequest = async (req: Request, res: Response) => {
+      const sessionId = req.headers['mcp-session-id'] as string | undefined;
+      const transport = sessionId ? this.httpTransports[sessionId] : undefined;
+      if (!transport) {
+        res.status(400).send('Invalid or missing mcp-session-id header');
+        return;
+      }
+      try {
+        await transport.handleRequest(req, res);
+      } catch (error) {
+        log.error(`Error handling ${req.method} /mcp for session ${sessionId}:`, error);
+        if (!res.headersSent) {
+          res.status(500).send('Internal server error');
+        }
+      }
+    };
+    app.get('/mcp', ...guards, handleSessionRequest);
+    app.delete('/mcp', ...guards, handleSessionRequest);
+
+    return new Promise<void>((resolve, reject) => {
+      this.httpServer = app.listen(port, host, () => {
+        log.info(`Streamable HTTP endpoint listening on http://${host}:${port}/mcp`);
+        resolve();
+      });
+      this.httpServer.on('error', (error: Error) => {
+        log.error('HTTP server failed to start:', error);
+        reject(error);
+      });
+    });
   }
 
   /**
@@ -100,28 +243,32 @@ export class WhatsAppMcpServer {
    */
   async shutdown(): Promise<void> {
     log.info('Shutting down WhatsApp MCP Server...');
-    
+
     try {
       // First destroy the WhatsApp client to properly close the Puppeteer browser
       // This will also unregister the browser PID
       log.info('Destroying WhatsApp client...');
       await this.whatsapp.destroy();
       log.info('WhatsApp client destroyed successfully');
-      
-      // Close all SSE transports if any are active
-      const sessionIds = Object.keys(this.sseTransports);
+
+      // Close all active Streamable HTTP sessions
+      const sessionIds = Object.keys(this.httpTransports);
       if (sessionIds.length > 0) {
-        log.info(`Closing ${sessionIds.length} active SSE transports...`);
+        log.info(`Closing ${sessionIds.length} active HTTP sessions...`);
         for (const sessionId of sessionIds) {
           try {
-            // Clean up the transport
-            delete this.sseTransports[sessionId];
+            await this.httpTransports[sessionId]?.close();
           } catch (error) {
-            log.warn(`Error closing SSE transport ${sessionId}:`, error);
+            log.warn(`Error closing HTTP session ${sessionId}:`, error);
           }
+          delete this.httpTransports[sessionId];
         }
       }
-      
+      if (this.httpServer) {
+        this.httpServer.close();
+        this.httpServer = null;
+      }
+
       // Final check for any orphaned processes that might have been missed
       try {
         await this.browserProcessManager.cleanupOrphanedProcesses();
@@ -129,85 +276,11 @@ export class WhatsAppMcpServer {
         log.warn('Error during final browser process cleanup:', cleanupError);
         // Continue with shutdown even if cleanup fails
       }
-      
+
       log.info('Server shutdown completed successfully');
     } catch (error) {
       log.error('Error during server shutdown:', error);
       throw error;
     }
   }
-
-  private async startSseTransport(port = 3001) {
-    log.info(`Starting MCP server with SSE transport on port ${port}...`);
-    const app = express();
-
-    // Endpoint for establishing SSE connection
-    app.get('/sse', async (_req: Request, res: Response) => { // Prefix req with _
-      log.info('SSE connection requested');
-      const transport = new SSEServerTransport('/messages', res);
-      this.sseTransports[transport.sessionId] = transport;
-
-      // Handle transport errors
-      transport.onerror = (error) => {
-        log.error(`SSE Transport Error (Session ${transport.sessionId}):`, error);
-        // Clean up transport on error
-        delete this.sseTransports[transport.sessionId];
-      };
-
-      res.on('close', () => {
-        log.info(`SSE connection closed (Session ${transport.sessionId})`);
-        delete this.sseTransports[transport.sessionId];
-        // Optionally call transport.close() or server-side cleanup if needed
-      });
-
-      try {
-        await this.server.connect(transport);
-        log.info(`SSE transport connected (Session ${transport.sessionId})`);
-      } catch (error) {
-        log.error(`Failed to connect SSE transport (Session ${transport.sessionId}):`, error);
-        delete this.sseTransports[transport.sessionId];
-        if (!res.headersSent) {
-          res.status(500).send('Failed to connect MCP server');
-        }
-      }
-    });
-
-    // Endpoint for receiving messages from the client via POST
-    app.post('/messages', express.json({ limit: '10mb' }), async (req: Request, res: Response) => { // Add types
-      const sessionId = req.query.sessionId as string;
-      const transport = this.sseTransports[sessionId];
-
-      if (transport) {
-        log.debug(`Received POST message for session ${sessionId}`);
-        try {
-          // Pass raw body if needed, or parsed body
-          await transport.handlePostMessage(req, res, req.body);
-          // handlePostMessage sends the response (202 Accepted or error)
-        } catch (error) {
-          log.error(`Error handling POST message for session ${sessionId}:`, error);
-          // Ensure response is sent if handlePostMessage failed before sending
-          if (!res.headersSent) {
-             res.status(500).send('Error processing message');
-          }
-        }
-      } else {
-        log.warn(`No active SSE transport found for sessionId: ${sessionId}`);
-        res.status(400).send('No active SSE transport found for this session ID');
-      }
-    });
-
-    return new Promise<void>((resolve, reject) => {
-      const serverInstance = app.listen(port, () => {
-        log.info(`SSE server listening on http://localhost:${port}`);
-        resolve();
-      });
-
-      serverInstance.on('error', (error: Error) => { // Add type
-        log.error('SSE server failed to start:', error);
-        reject(error);
-      });
-    });
-  }
-
-  // Add methods for registering specific tool groups if needed
 }
