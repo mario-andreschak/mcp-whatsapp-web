@@ -89,7 +89,11 @@ process.on('unhandledRejection', (reason) => {
 });
 
 async function main() {
-  log.info('Starting WhatsApp MCP Server...');
+  // One-line banner with pid: multiple server processes share the same log
+  // file, so the pid is what lets you tell their lifecycles apart.
+  log.info(
+    `Starting WhatsApp MCP Server v1.1.0 (pid ${process.pid}, node ${process.version}, cwd ${process.cwd()})`,
+  );
   
   // Clean up any orphaned browser processes before starting
   try {

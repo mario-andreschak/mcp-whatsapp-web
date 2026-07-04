@@ -404,6 +404,53 @@ export class WhatsAppService {
     return this.latestPairingCode;
   }
 
+  /**
+   * Wait for the client to become ready instead of failing immediately.
+   *
+   * MCP clients (e.g. FLUJO workflows) often call tools within seconds of
+   * spawning this server, while WhatsApp Web needs ~15-20s to restore a
+   * session. Failing fast produced spurious "client not ready" errors; instead
+   * we block the tool call until ready, or fail fast once it is clear that
+   * user interaction is required (a QR code / pairing code is pending).
+   */
+  async ensureReady(timeoutMs = Number(process.env.TOOL_READY_TIMEOUT_MS || 45_000)): Promise<void> {
+    if (this.isInitialized) return;
+    const start = Date.now();
+    log.info(`Tool call received while client is not ready; waiting up to ${Math.round(timeoutMs / 1000)}s...`);
+    const deadline = start + timeoutMs;
+    while (Date.now() < deadline) {
+      if (this.isInitialized) {
+        log.info(`Client became ready after ${((Date.now() - start) / 1000).toFixed(1)}s; continuing tool call.`);
+        return;
+      }
+      if (this.latestQrCode || this.latestPairingCode) {
+        throw new Error(
+          'WhatsApp is not authenticated: a QR code / pairing code is waiting to be used. ' +
+            'Authenticate via get_qr_code or request_pairing_code first.',
+        );
+      }
+      await new Promise((resolve) => setTimeout(resolve, 250));
+    }
+    throw new Error(
+      `WhatsApp client did not become ready within ${Math.round(timeoutMs / 1000)}s. ` +
+        'It may still be starting up, or another server instance may hold the session - try again shortly.',
+    );
+  }
+
+  /**
+   * Wait until the initial connection attempt has a definitive outcome:
+   * ready, or waiting for user authentication (QR/pairing code emitted).
+   * Used by check_auth_status so a freshly started server reports the truth
+   * instead of a premature "not authenticated".
+   */
+  async waitForAuthOutcome(timeoutMs = 25_000): Promise<void> {
+    const deadline = Date.now() + timeoutMs;
+    while (Date.now() < deadline) {
+      if (this.isInitialized || this.latestQrCode || this.latestPairingCode) return;
+      await new Promise((resolve) => setTimeout(resolve, 250));
+    }
+  }
+
   /** Register a listener fired when the WhatsApp session is unlinked or fails to authenticate. */
   onSessionInvalidated(listener: () => void): void {
     this.sessionInvalidatedListeners.push(listener);
@@ -459,7 +506,7 @@ export class WhatsAppService {
   // Note: WWebContact and WWebChat aliases are removed from imports, use Contact and Chat directly
 
   async searchContacts(query: string): Promise<SimpleContact[]> {
-    if (!this.isInitialized) throw new Error('WhatsApp client not ready');
+    await this.ensureReady();
     const contacts = await this.client.getContacts();
     const lowerQuery = query.toLowerCase();
 
@@ -467,7 +514,7 @@ export class WhatsAppService {
       .filter(
         (contact) =>
           (contact.name?.toLowerCase().includes(lowerQuery) ||
-           contact.number.includes(query) || // Phone numbers usually don't need lowercasing
+           contact.number?.includes(query) || // number can be null for some contacts
            contact.pushname?.toLowerCase().includes(lowerQuery)) &&
           contact.isUser // Filter out groups/broadcasts if needed
       )
@@ -475,7 +522,7 @@ export class WhatsAppService {
   }
 
   async listChats(limit = 20, includeLastMessage = true): Promise<SimpleChat[]> {
-     if (!this.isInitialized) throw new Error('WhatsApp client not ready');
+     await this.ensureReady();
      const chats = await this.client.getChats();
      // Sort by timestamp descending (most recent first)
      chats.sort((a, b) => b.timestamp - a.timestamp);
@@ -510,7 +557,7 @@ export class WhatsAppService {
   }
 
   async getChatById(chatId: string): Promise<SimpleChat | null> {
-    if (!this.isInitialized) throw new Error('WhatsApp client not ready');
+    await this.ensureReady();
     try {
       const chat = await this.client.getChatById(chatId);
       return this.mapChatToSimpleChat(chat);
@@ -521,7 +568,7 @@ export class WhatsAppService {
   }
 
    async getContactById(contactId: string): Promise<SimpleContact | null> {
-    if (!this.isInitialized) throw new Error('WhatsApp client not ready');
+    await this.ensureReady();
     try {
       const contact = await this.client.getContactById(contactId);
       return this.mapContactToSimpleContact(contact);
@@ -532,7 +579,7 @@ export class WhatsAppService {
   }
 
   async getMessages(chatId: string, limit = 50): Promise<SimpleMessage[]> {
-    if (!this.isInitialized) throw new Error('WhatsApp client not ready');
+    await this.ensureReady();
     try {
       const chat = await this.client.getChatById(chatId);
       if (!chat) throw new Error(`Chat not found: ${chatId}`);
@@ -545,7 +592,7 @@ export class WhatsAppService {
   }
 
   async getMessageById(messageId: string): Promise<SimpleMessage | null> {
-     if (!this.isInitialized) throw new Error('WhatsApp client not ready');
+     await this.ensureReady();
      try {
          const message = await this.client.getMessageById(messageId);
       return message ? this.mapMessageToSimpleMessage(message) : null;
@@ -556,13 +603,13 @@ export class WhatsAppService {
   }
 
   async sendMessage(to: string, content: string): Promise<WAWebJS.Message> {
-    if (!this.isInitialized) throw new Error('WhatsApp client not ready');
+    await this.ensureReady();
     log.info(`Sending message to ${to}`);
     return this.client.sendMessage(to, content);
   }
 
   async sendMedia(to: string, mediaPathOrUrl: string, caption?: string): Promise<WAWebJS.Message> {
-    if (!this.isInitialized) throw new Error('WhatsApp client not ready');
+    await this.ensureReady();
     log.info(`Sending media from ${mediaPathOrUrl} to ${to}`);
     let media: WAWebJS.MessageMedia;
     if (mediaPathOrUrl.startsWith('http://') || mediaPathOrUrl.startsWith('https://')) {
@@ -574,14 +621,14 @@ export class WhatsAppService {
   }
 
    async sendMediaFromBase64(to: string, base64Data: string, mimeType: string, filename?: string, caption?: string): Promise<WAWebJS.Message> {
-    if (!this.isInitialized) throw new Error('WhatsApp client not ready');
+    await this.ensureReady();
     log.info(`Sending media from base64 to ${to}`);
     const media = new MessageMedia(mimeType, base64Data, filename);
     return this.client.sendMessage(to, media, { caption });
   }
 
   async downloadMedia(messageId: string): Promise<WAWebJS.MessageMedia | null> {
-    if (!this.isInitialized) throw new Error('WhatsApp client not ready');
+    await this.ensureReady();
     try {
       const message = await this.client.getMessageById(messageId);
       if (message && message.hasMedia) {

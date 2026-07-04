@@ -177,6 +177,11 @@ async function checkAuthStatus(
   whatsappService: WhatsAppService
 ): Promise<CallToolResult> {
   try {
+    // On a freshly started server the client may still be restoring its
+    // session; wait for a definitive outcome (ready or QR/pairing pending)
+    // instead of reporting a premature "not authenticated".
+    await whatsappService.waitForAuthOutcome();
+
     const isAuthenticated = whatsappService.isAuthenticated();
     const pairingCode = whatsappService.getLatestPairingCode();
 

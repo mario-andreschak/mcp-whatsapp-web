@@ -13,6 +13,7 @@ interface BrowserProcess {
   pid: number;
   startTime: number;
   serverInstanceId: string; // Unique ID for this server instance
+  serverPid?: number; // PID of the node process that owns this browser
 }
 
 /**
@@ -75,21 +76,17 @@ export class BrowserProcessManager {
     const processes = this.readProcesses();
     
     // Check if this PID is already registered
+    const entry: BrowserProcess = {
+      pid,
+      startTime: Date.now(),
+      serverInstanceId: this.serverInstanceId,
+      serverPid: process.pid,
+    };
     const existingIndex = processes.findIndex(p => p.pid === pid);
     if (existingIndex >= 0) {
-      // Update the existing entry
-      processes[existingIndex] = {
-        pid,
-        startTime: Date.now(),
-        serverInstanceId: this.serverInstanceId
-      };
+      processes[existingIndex] = entry;
     } else {
-      // Add a new entry
-      processes.push({
-        pid,
-        startTime: Date.now(),
-        serverInstanceId: this.serverInstanceId
-      });
+      processes.push(entry);
     }
     
     this.saveProcesses(processes);
@@ -167,30 +164,48 @@ export class BrowserProcessManager {
     const processes = this.readProcesses();
     const validProcesses: BrowserProcess[] = [];
     
-    for (const process of processes) {
-      const isRunning = await this.isProcessRunning(process.pid);
-      
-      if (isRunning) {
-        // Process is still running, check if it's orphaned
-        // We consider a process orphaned if it's not from this server instance
-        // and it's been running for more than 10 minutes
-        const isFromCurrentInstance = process.serverInstanceId === this.serverInstanceId;
-        const processAgeMs = Date.now() - process.startTime;
-        const isOld = processAgeMs > 10 * 60 * 1000; // 10 minutes
-        
-        if (!isFromCurrentInstance && isOld) {
-          log.info(`Found orphaned browser process with PID: ${process.pid}`);
-          const killed = await this.killProcess(process.pid);
-          if (!killed) {
-            // If we couldn't kill it, keep it in the list
-            validProcesses.push(process);
-          }
-        } else {
-          // Process is still valid
-          validProcesses.push(process);
-        }
+    for (const entry of processes) {
+      const isRunning = await this.isProcessRunning(entry.pid);
+      if (!isRunning) {
+        // Browser is gone; just drop the stale entry
+        continue;
       }
-      // If not running, we don't add it to validProcesses
+
+      const isFromCurrentInstance = entry.serverInstanceId === this.serverInstanceId;
+      if (isFromCurrentInstance) {
+        validProcesses.push(entry);
+        continue;
+      }
+
+      // A browser is orphaned exactly when the node process that owned it is
+      // dead (e.g. an MCP client force-killed the server, leaving the browser
+      // holding the session-directory lock). If the owning server is still
+      // alive, the browser is legitimately in use - never kill it.
+      if (entry.serverPid !== undefined) {
+        const ownerAlive = entry.serverPid === process.pid || (await this.isProcessRunning(entry.serverPid));
+        if (ownerAlive) {
+          validProcesses.push(entry);
+        } else {
+          log.info(`Browser PID ${entry.pid} is orphaned (owning server ${entry.serverPid} is dead), killing it.`);
+          const killed = await this.killProcess(entry.pid);
+          if (!killed) {
+            validProcesses.push(entry);
+          }
+        }
+        continue;
+      }
+
+      // Legacy entry without serverPid: fall back to the old age heuristic
+      const isOld = Date.now() - entry.startTime > 10 * 60 * 1000; // 10 minutes
+      if (isOld) {
+        log.info(`Found orphaned browser process with PID: ${entry.pid} (legacy entry)`);
+        const killed = await this.killProcess(entry.pid);
+        if (!killed) {
+          validProcesses.push(entry);
+        }
+      } else {
+        validProcesses.push(entry);
+      }
     }
     
     // Save the updated list

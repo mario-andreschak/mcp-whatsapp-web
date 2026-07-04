@@ -109,7 +109,20 @@ export class WhatsAppMcpServer {
     stdioTransport.onerror = (error) => {
       log.error('StdioTransport Error:', error);
     };
-    await this.createServer().connect(stdioTransport);
+    const server = this.createServer();
+    await server.connect(stdioTransport);
+    // When the MCP client disconnects (stdin closed), nothing can ever reach
+    // this process over stdio again - shut down cleanly so the browser is
+    // released and no zombie process keeps the WhatsApp session dir locked.
+    // (The SDK's stdio transport only listens for 'data'/'error', so it never
+    // notices stdin ending; watch it ourselves. This intentionally also ends
+    // dual-mode stdio+HTTP processes: the spawning client owns the lifecycle.)
+    const shutdownOnStdinClose = (event: string) => () => {
+      log.warn(`stdin ${event}: MCP client disconnected, shutting down.`);
+      process.emit('SIGTERM' as 'disconnect');
+    };
+    process.stdin.once('end', shutdownOnStdinClose('end'));
+    process.stdin.once('close', shutdownOnStdinClose('close'));
     log.info('MCP server connected via stdio.');
   }
 
