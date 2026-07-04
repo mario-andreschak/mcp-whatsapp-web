@@ -55,8 +55,16 @@ export interface SimpleMessage {
   // Add more fields as needed
 }
 
+/** Injectable dependencies, used by tests to substitute fakes. */
+export interface WhatsAppServiceDeps {
+  /** Factory producing a (fake) whatsapp-web.js Client. Defaults to `new Client(options)`. */
+  clientFactory?: (options: WAWebJS.ClientOptions) => WAWebJS.Client;
+  browserProcessManager?: BrowserProcessManager;
+}
+
 export class WhatsAppService {
   private client: WAWebJS.Client;
+  private readonly clientFactory?: (options: WAWebJS.ClientOptions) => WAWebJS.Client;
   private isInitialized = false;
   private latestQrCode: string | null = null; // Added to store QR code
   private latestPairingCode: string | null = null; // Set when phone number pairing is active
@@ -69,22 +77,35 @@ export class WhatsAppService {
   private reconnectTimer: NodeJS.Timeout | null = null;
   private healthCheckTimer: NodeJS.Timeout | null = null;
   private suppressReconnect = false; // Set during intentional shutdown/logout
+  // In-flight initialize()/destroy(), so concurrent callers share one attempt
+  // instead of racing puppeteer (destroy-during-init is what produced the
+  // "Protocol error ... Target closed" storms under FLUJO's restart loop).
+  private initPromise: Promise<void> | null = null;
+  private destroyPromise: Promise<void> | null = null;
+  private registeredBrowserPid: number | null = null;
+  // LocalAuth profile location. Overridable so multiple instances (or e2e
+  // tests) can run against isolated session directories.
+  private readonly sessionDataPath = process.env.WHATSAPP_SESSION_DIR
+    ? path.resolve(process.env.WHATSAPP_SESSION_DIR)
+    : path.join(process.cwd(), 'whatsapp-sessions');
   // Notified when the WhatsApp session itself becomes invalid (logout or
   // authentication failure) - used e.g. to revoke OAuth tokens.
   private sessionInvalidatedListeners: Array<() => void> = [];
 
-  constructor() {
-    this.browserProcessManager = new BrowserProcessManager();
+  constructor(deps?: WhatsAppServiceDeps) {
+    this.clientFactory = deps?.clientFactory;
+    this.browserProcessManager = deps?.browserProcessManager ?? new BrowserProcessManager();
     this.client = this.createClient();
   }
 
   private buildClientOptions(): WAWebJS.ClientOptions {
     return {
       authStrategy: new LocalAuth({
-        dataPath: path.join(process.cwd(), 'whatsapp-sessions'), // Store sessions in project root
+        dataPath: this.sessionDataPath, // Project root by default; WHATSAPP_SESSION_DIR overrides
       }),
       puppeteer: {
-        headless: true, // Run headless
+        // WHATSAPP_HEADLESS=false shows the browser window (debugging aid)
+        headless: process.env.WHATSAPP_HEADLESS !== 'false',
         args: [
           '--no-sandbox',
           '--disable-setuid-sandbox',
@@ -124,8 +145,10 @@ export class WhatsAppService {
   }
 
   private createClient(): WAWebJS.Client {
-    const client = new Client(this.buildClientOptions());
+    const options = this.buildClientOptions();
+    const client = this.clientFactory ? this.clientFactory(options) : new Client(options);
     this.setupEventHandlers(client);
+    this.registeredBrowserPid = null; // A new client means a new browser
     return client;
   }
 
@@ -309,61 +332,190 @@ export class WhatsAppService {
       log.warn('WhatsApp client already initialized.');
       return;
     }
+    // Share one in-flight attempt between concurrent callers
+    if (this.initPromise) {
+      return this.initPromise;
+    }
+    const attempt = (async () => {
+      try {
+        await this.doInitialize();
+      } finally {
+        this.initPromise = null;
+      }
+    })();
+    this.initPromise = attempt;
+    return attempt;
+  }
 
+  private async doInitialize(): Promise<void> {
     // Re-enable auto-reconnect (it is suppressed during logout/shutdown)
     this.suppressReconnect = false;
 
-    // Clean up any orphaned browser processes before starting
+    // Clean up any orphaned browser processes before starting: both the ones
+    // we know from the PID file and any unregistered leftover that still holds
+    // the profile lock (e.g. the server was force-killed mid-initialize).
     await this.browserProcessManager.cleanupOrphanedProcesses();
+    await this.browserProcessManager.killBrowsersUsingProfile(this.sessionDataPath);
 
     log.info('Initializing WhatsApp client...');
+    const client = this.client;
     try {
-      await this.client.initialize();
+      const initInFlight = client.initialize();
+      // Register the browser PID as soon as puppeteer has launched, NOT after
+      // the full 15-20s initialization: if the process is killed mid-init, the
+      // PID file is the only way the next instance can find the leftover browser.
+      void this.registerBrowserPidEarly(client, initInFlight);
+      await initInFlight;
 
-      // Register the browser process
-      const pid = await this.getBrowserPid();
+      const pid = this.tryGetBrowserPid(client);
       if (pid) {
-        this.browserProcessManager.registerProcess(pid);
-        log.info(`Registered browser process with PID: ${pid}`);
+        this.registerBrowserPid(pid);
       } else {
         log.warn('Could not determine browser PID after initialization');
       }
     } catch (error) {
+      if (this.suppressReconnect) {
+        // Shutdown/destroy raced the initialization - expected, not an error
+        log.info('WhatsApp client initialization aborted by shutdown.');
+        throw error;
+      }
       log.error('Error initializing WhatsApp client:', error);
+      const message = error instanceof Error ? error.message : String(error);
+      if (/already running/i.test(message)) {
+        // A leftover browser (ours or a zombie predecessor's) holds the profile
+        // lock. Kill it and retry instead of staying broken until a restart.
+        log.warn('Browser profile is locked; killing the lock holder and scheduling a retry.');
+        try {
+          await this.browserProcessManager.killBrowsersUsingProfile(this.sessionDataPath, {
+            includeOwnedByCurrentProcess: true,
+          });
+        } catch (cleanupError) {
+          log.warn('Failed to clear the locked browser profile:', cleanupError);
+        }
+        this.scheduleReconnect('browser profile was locked by a leftover process');
+      }
       throw error;
     }
   }
 
+  /**
+   * Poll for the puppeteer browser PID while initialize() is still running and
+   * register it the moment it exists. Stops as soon as the PID is registered
+   * or the initialization settles (doInitialize then does a final attempt).
+   */
+  private async registerBrowserPidEarly(
+    client: WAWebJS.Client,
+    initInFlight: Promise<unknown>,
+  ): Promise<void> {
+    let settled = false;
+    initInFlight.then(
+      () => (settled = true),
+      () => (settled = true),
+    );
+    const POLL_INTERVAL_MS = 250;
+    const MAX_POLLS = 240; // Give up after 60s; init has failed long before that
+    for (let i = 0; i < MAX_POLLS && !settled; i++) {
+      const pid = this.tryGetBrowserPid(client);
+      if (pid) {
+        this.registerBrowserPid(pid);
+        return;
+      }
+      await new Promise((resolve) => setTimeout(resolve, POLL_INTERVAL_MS));
+    }
+  }
+
+  private registerBrowserPid(pid: number): void {
+    if (this.registeredBrowserPid === pid) {
+      return; // Already registered (early poller and post-init both call this)
+    }
+    this.registeredBrowserPid = pid;
+    this.browserProcessManager.registerProcess(pid);
+    log.info(`Registered browser process with PID: ${pid}`);
+  }
+
   async destroy(): Promise<void> {
+    // Share one in-flight teardown between concurrent callers (shutdown signal
+    // + stdin close + reconnect can all arrive within milliseconds)
+    if (this.destroyPromise) {
+      return this.destroyPromise;
+    }
+    const attempt = (async () => {
+      try {
+        await this.doDestroy();
+      } finally {
+        this.destroyPromise = null;
+      }
+    })();
+    this.destroyPromise = attempt;
+    return attempt;
+  }
+
+  /**
+   * Best-effort teardown that NEVER hangs and never throws: a stdio server
+   * that cannot finish its shutdown becomes a zombie whose browser keeps the
+   * session directory locked for every future instance.
+   */
+  private async doDestroy(): Promise<void> {
     log.info('Destroying WhatsApp client...');
     this.suppressReconnect = true;
     this.cancelPendingReconnect();
     this.stopHealthCheck();
+    const client = this.client;
+
+    // Give an in-flight initialize() a moment to settle: destroying the
+    // browser mid script-injection is what produced the TargetCloseError
+    // storms. Keep it short - MCP clients on the stock SDK TerminateProcess
+    // us ~2s after closing stdin, so every ms spent waiting here comes out
+    // of the budget for the actual teardown below.
+    if (this.initPromise) {
+      await Promise.race([
+        this.initPromise.catch(() => {}),
+        new Promise((resolve) => setTimeout(resolve, 1_000)),
+      ]);
+    }
+
+    const pid = this.tryGetBrowserPid(client) ?? this.registeredBrowserPid;
     try {
-      // Get the PID before destroying the client
-      const pid = await this.getBrowserPid();
-      
-      // Ensure the client is properly destroyed to clean up the Puppeteer browser
-      await this.client.destroy();
-      this.isInitialized = false;
-      this.latestQrCode = null;
-      log.info('WhatsApp client destroyed successfully');
-      
-      // Unregister the browser process
-      if (pid) {
-        this.browserProcessManager.unregisterProcess(pid);
-        log.info(`Unregistered browser process with PID: ${pid}`);
-      }
-      
-      // Force garbage collection if possible to ensure browser process is released
-      if (global.gc) {
-        log.debug('Forcing garbage collection...');
-        global.gc();
+      if (this.isInitialized) {
+        await withTimeout(client.destroy(), 5_000, 'client.destroy()');
+        log.info('WhatsApp client destroyed successfully');
+      } else {
+        // The client never became ready: client.destroy()'s page-evaluate
+        // cleanup is the slow (and hang-prone) part and there is no session
+        // state to flush beyond the browser profile itself. Closing the
+        // browser directly is what actually flushes the profile to disk.
+        const browser = (client as { pupBrowser?: { close(): Promise<void> } }).pupBrowser;
+        if (browser) {
+          await withTimeout(browser.close(), 1_500, 'browser.close()');
+          log.info('Browser closed directly (client was not ready).');
+        } else {
+          log.info('No browser launched yet; nothing to close.');
+        }
       }
     } catch (error) {
-      log.error('Error destroying WhatsApp client:', error);
-      throw error;
+      log.warn('client.destroy() failed or timed out; force-killing the browser.', error);
+      try {
+        if (pid) {
+          await this.browserProcessManager.killProcessTree(pid);
+        } else {
+          // Browser never got registered (killed mid-launch): find it by its profile path
+          await this.browserProcessManager.killBrowsersUsingProfile(this.sessionDataPath, {
+            includeOwnedByCurrentProcess: true,
+          });
+        }
+      } catch (killError) {
+        log.warn('Force-kill of the browser failed:', killError);
+      }
     }
+
+    this.isInitialized = false;
+    this.latestQrCode = null;
+
+    if (pid) {
+      this.browserProcessManager.unregisterProcess(pid);
+      log.info(`Unregistered browser process with PID: ${pid}`);
+    }
+    this.registeredBrowserPid = null;
   }
 
   async logout(): Promise<void> {
@@ -373,7 +525,7 @@ export class WhatsAppService {
     this.stopHealthCheck();
     try {
       // Get the PID before logging out
-      const pid = await this.getBrowserPid();
+      const pid = this.tryGetBrowserPid();
 
       // Logout from WhatsApp
       await this.client.logout();
@@ -711,47 +863,74 @@ export class WhatsAppService {
   }
   
   /**
-   * Get the process ID of the Chrome browser used by this WhatsApp client
-   * @returns The browser PID or null if not available
+   * Get the process ID of the Chrome browser used by the given (or current)
+   * client, or null if the browser has not launched (yet). Quiet by design:
+   * it is polled repeatedly while the browser is still starting.
    */
-  async getBrowserPid(): Promise<number | null> {
+  tryGetBrowserPid(client: WAWebJS.Client = this.client): number | null {
     try {
-      if (!this.client) {
+      if (!client) {
         return null;
       }
-      
+
       // Access the internal puppeteer browser
       // This is a bit hacky but necessary to get the browser PID
-      const client = this.client as any;
-      
+      const internal = client as any;
+
       // Try different ways to access the browser
       let browser = null;
-      
+
       // Method 1: Try to access through pupBrowser property (if available)
-      if (client.pupBrowser) {
-        browser = client.pupBrowser;
-      } 
+      if (internal.pupBrowser) {
+        browser = internal.pupBrowser;
+      }
       // Method 2: Try to access through _page property
-      else if (client._page && client._page.browser) {
-        browser = client._page.browser();
+      else if (internal._page && internal._page.browser) {
+        browser = internal._page.browser();
       }
       // Method 3: Try to access through puppeteer property
-      else if (client.puppeteer && client.puppeteer.browser) {
-        browser = client.puppeteer.browser;
+      else if (internal.puppeteer && internal.puppeteer.browser) {
+        browser = internal.puppeteer.browser;
       }
-      
+
       if (browser) {
-        const process = browser.process();
-        if (process) {
-          return process.pid;
+        const browserProcess = browser.process();
+        if (browserProcess) {
+          return browserProcess.pid ?? null;
         }
       }
-      
-      log.warn('Could not access browser PID through any known method');
+
       return null;
     } catch (error) {
       log.error('Error getting browser PID:', error);
       return null;
     }
   }
+
+  /** @deprecated Use tryGetBrowserPid(); kept for backwards compatibility. */
+  async getBrowserPid(): Promise<number | null> {
+    return this.tryGetBrowserPid();
+  }
+}
+
+/**
+ * Resolve with the promise, or reject once the timeout elapses - whichever
+ * comes first. The underlying operation is not cancelled; callers use this to
+ * stop WAITING on puppeteer teardown that may never finish.
+ */
+function withTimeout<T>(promise: Promise<T>, ms: number, label: string): Promise<T> {
+  return new Promise<T>((resolve, reject) => {
+    const timer = setTimeout(() => reject(new Error(`${label} timed out after ${ms}ms`)), ms);
+    timer.unref?.();
+    promise.then(
+      (value) => {
+        clearTimeout(timer);
+        resolve(value);
+      },
+      (error) => {
+        clearTimeout(timer);
+        reject(error);
+      },
+    );
+  });
 }

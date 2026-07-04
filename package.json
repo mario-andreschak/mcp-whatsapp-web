@@ -9,9 +9,12 @@
     "start": "node --no-deprecation dist/index.js",
     "dev": "tsc -w & node --no-deprecation --watch dist/index.js",
     "debug": "npx @modelcontextprotocol/inspector node --no-deprecation --trace-deprecation dist/index.js",
-    "lint": "eslint src",
+    "lint": "eslint src test",
     "format": "prettier --write src/**/*.ts",
-    "cleanup-browsers": "node dist/utils/cleanup-browsers.js"
+    "cleanup-browsers": "node dist/utils/cleanup-browsers.js",
+    "test": "vitest run",
+    "test:watch": "vitest",
+    "test:e2e": "npm run build && vitest run --config vitest.e2e.config.ts"
   },
   "keywords": [
     "mcp",
@@ -47,7 +50,8 @@
     "eslint": "^9.39.4",
     "eslint-config-prettier": "^9.1.0",
     "prettier": "^3.3.2",
-    "typescript-eslint": "^8.62.1"
+    "typescript-eslint": "^8.62.1",
+    "vitest": "^4.1.9"
   },
   "allowScripts": {
     "ffmpeg-static@5.3.0": true,

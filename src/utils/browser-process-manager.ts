@@ -1,10 +1,22 @@
 import fs from 'fs';
 import path from 'path';
 import { log } from './logger.js';
-import { exec } from 'child_process';
+import { exec, execFile } from 'child_process';
 import { promisify } from 'util';
 
 const execAsync = promisify(exec);
+const execFileAsync = promisify(execFile);
+
+// windowsHide stops tasklist/taskkill/powershell from flashing a visible
+// console window when the server runs under a GUI parent (FLUJO, Claude, ...).
+const EXEC_OPTS = { windowsHide: true } as const;
+
+function parsePids(stdout: string): number[] {
+  return stdout
+    .split(/\r?\n/)
+    .map((line) => parseInt(line.trim(), 10))
+    .filter((pid) => Number.isFinite(pid) && pid > 0);
+}
 
 /**
  * Interface representing a browser process entry
@@ -25,9 +37,10 @@ export class BrowserProcessManager {
 
   /**
    * Creates a new BrowserProcessManager
+   * @param pidFilePath Override the PID-file location (used by tests)
    */
-  constructor() {
-    this.pidFilePath = path.join(process.cwd(), '.chrome-pids.json');
+  constructor(pidFilePath?: string) {
+    this.pidFilePath = pidFilePath ?? path.join(process.cwd(), '.chrome-pids.json');
     // Generate a unique ID for this server instance
     this.serverInstanceId = Date.now().toString() + '-' + Math.random().toString(36).substring(2, 15);
     
@@ -120,11 +133,11 @@ export class BrowserProcessManager {
     try {
       if (process.platform === 'win32') {
         // Windows
-        const { stdout } = await execAsync(`tasklist /FI "PID eq ${pid}" /NH`);
+        const { stdout } = await execAsync(`tasklist /FI "PID eq ${pid}" /NH`, EXEC_OPTS);
         return stdout.includes(pid.toString());
       } else {
         // Unix-like (Linux, macOS)
-        await execAsync(`ps -p ${pid} -o pid=`);
+        await execAsync(`ps -p ${pid} -o pid=`, EXEC_OPTS);
         return true;
       }
     } catch {
@@ -144,16 +157,116 @@ export class BrowserProcessManager {
       
       if (process.platform === 'win32') {
         // Windows
-        await execAsync(`taskkill /F /PID ${pid}`);
+        await execAsync(`taskkill /F /PID ${pid}`, EXEC_OPTS);
       } else {
         // Unix-like (Linux, macOS)
-        await execAsync(`kill -9 ${pid}`);
+        await execAsync(`kill -9 ${pid}`, EXEC_OPTS);
       }
       return true;
     } catch (error) {
       log.error(`Failed to kill process ${pid}:`, error);
       return false;
     }
+  }
+
+  /**
+   * Force-kill a process and all of its children. Used as the last resort when
+   * a graceful client.destroy() hangs or times out: a browser left half-alive
+   * keeps the WhatsApp session directory locked for every future instance.
+   */
+  async killProcessTree(pid: number): Promise<boolean> {
+    try {
+      log.info(`Force-killing browser process tree with root PID: ${pid}`);
+      if (process.platform === 'win32') {
+        await execAsync(`taskkill /F /T /PID ${pid}`, EXEC_OPTS);
+      } else {
+        await execAsync(`kill -9 ${pid}`, EXEC_OPTS);
+      }
+      return true;
+    } catch (error) {
+      log.warn(`Failed to kill process tree ${pid}:`, error);
+      return false;
+    }
+  }
+
+  /**
+   * Find browser processes whose command line references the given profile
+   * (user-data-dir) path. Unlike the PID file, this catches browsers that were
+   * never registered (e.g. the server was force-killed mid-initialize) - the
+   * exact processes that keep the session directory locked.
+   */
+  async findBrowsersUsingProfile(userDataDir: string): Promise<number[]> {
+    try {
+      if (process.platform === 'win32') {
+        // The profile path travels via an env var and is compared with
+        // String.Contains (no regex, no quoting) so paths with spaces,
+        // parentheses, quotes, etc. cannot break the query. -EncodedCommand
+        // sidesteps every layer of argv/PowerShell quoting.
+        const script =
+          '$dir = $env:WA_MCP_PROFILE_DIR; ' +
+          'Get-CimInstance Win32_Process -Filter "Name=\'chrome.exe\' OR Name=\'msedge.exe\' OR Name=\'chromium.exe\' OR Name=\'headless_shell.exe\'" | ' +
+          'Where-Object { $_.CommandLine -and $_.CommandLine.Contains($dir) } | ' +
+          'ForEach-Object { $_.ProcessId }';
+        const encoded = Buffer.from(script, 'utf16le').toString('base64');
+        const { stdout } = await execFileAsync(
+          'powershell',
+          ['-NoProfile', '-NonInteractive', '-EncodedCommand', encoded],
+          { ...EXEC_OPTS, env: { ...process.env, WA_MCP_PROFILE_DIR: userDataDir } },
+        );
+        return parsePids(stdout);
+      } else {
+        // pgrep -f matches against the full command line; escape the path so
+        // it is treated as a literal string, not a regex.
+        const pattern = userDataDir.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+        const { stdout } = await execFileAsync('pgrep', ['-f', pattern], EXEC_OPTS);
+        return parsePids(stdout);
+      }
+    } catch {
+      // pgrep exits non-zero when nothing matches; treat all failures as "none found"
+      return [];
+    }
+  }
+
+  /**
+   * Kill browser processes that hold the given profile directory, except those
+   * legitimately owned by a still-running server instance. This is the
+   * self-healing path for "The browser is already running for <session dir>"
+   * launch failures caused by force-killed or zombie predecessors.
+   *
+   * @param opts.includeOwnedByCurrentProcess Also kill browsers registered to
+   *        THIS process (used when tearing down our own hung browser).
+   * @returns Number of processes killed.
+   */
+  async killBrowsersUsingProfile(
+    userDataDir: string,
+    opts: { includeOwnedByCurrentProcess?: boolean } = {},
+  ): Promise<number> {
+    const pids = await this.findBrowsersUsingProfile(userDataDir);
+    if (pids.length === 0) {
+      return 0;
+    }
+    const registered = this.readProcesses();
+    let killedCount = 0;
+    for (const pid of pids) {
+      const entry = registered.find((p) => p.pid === pid);
+      if (entry?.serverPid !== undefined) {
+        const ownedByUs = entry.serverPid === process.pid;
+        const ownerAlive = ownedByUs || (await this.isProcessRunning(entry.serverPid));
+        // Never touch a browser whose owning server is alive - it legitimately
+        // holds the session (unless it is ours and the caller asked for it).
+        if (ownerAlive && !(ownedByUs && opts.includeOwnedByCurrentProcess)) {
+          continue;
+        }
+      }
+      if (await this.killProcessTree(pid)) {
+        killedCount++;
+        this.unregisterProcess(pid);
+      }
+    }
+    if (killedCount > 0) {
+      log.info(`Killed ${killedCount} browser process(es) holding the profile at ${userDataDir}.`);
+    }
+    return killedCount;
   }
 
   /**

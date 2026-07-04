@@ -36,7 +36,19 @@ async function gracefulShutdown(signal: string): Promise<void> {
   
   isShuttingDown = true;
   log.info(`Received ${signal}. Shutting down gracefully...`);
-  
+
+  // Hard watchdog: a stdio child must never outlive its MCP client for long.
+  // If graceful shutdown wedges (e.g. puppeteer teardown hangs), force-exit so
+  // no zombie process keeps the WhatsApp session directory locked - that lock
+  // is what breaks every subsequent server start with "browser already running".
+  const SHUTDOWN_WATCHDOG_MS = 10_000;
+  const watchdog = setTimeout(() => {
+    log.error(`Graceful shutdown did not complete within ${SHUTDOWN_WATCHDOG_MS / 1000}s; forcing exit.`);
+    process.exit(1);
+  }, SHUTDOWN_WATCHDOG_MS);
+  watchdog.unref?.();
+
+
   try {
     if (serverInstance) {
       // Use the server's shutdown method to clean up resources
@@ -50,11 +62,13 @@ async function gracefulShutdown(signal: string): Promise<void> {
     }
     
     log.info('Shutdown completed successfully');
-    
-    // Use a timeout to allow logs to be flushed before exiting
+
+    // Brief pause to let logs flush before exiting. Kept short: stock-SDK MCP
+    // clients TerminateProcess us ~2s after closing stdin, so time spent here
+    // is time stolen from the teardown work above.
     setTimeout(() => {
       process.exit(0);
-    }, 500);
+    }, 100);
   } catch (error) {
     log.error('Error during graceful shutdown:', error);
     
@@ -68,7 +82,7 @@ async function gracefulShutdown(signal: string): Promise<void> {
     // Use a timeout to allow error logs to be flushed before exiting
     setTimeout(() => {
       process.exit(1);
-    }, 500);
+    }, 100);
   }
 }
 

@@ -68,7 +68,7 @@ FFmpeg is bundled automatically via the `ffmpeg-static` npm package — no manua
    cp .env.example .env
    ```
 
-   You can adjust logging levels, pin the WhatsApp Web version, or override the auto-detected browser (`BROWSER_EXECUTABLE_PATH`) and ffmpeg binary (`FFMPEG_PATH`) if needed.
+   You can adjust logging levels, pin the WhatsApp Web version, or override the auto-detected browser (`BROWSER_EXECUTABLE_PATH`) and ffmpeg binary (`FFMPEG_PATH`) if needed. `WHATSAPP_HEADLESS=false` shows the browser window (debugging aid), and `WHATSAPP_SESSION_DIR` relocates the session/browser-profile directory (useful for running multiple instances or isolated test runs).
 
 ### Installation with FLUJO
 
@@ -266,6 +266,9 @@ This utility will:
 - `npm run lint`- Run ESLint
 - `npm run format`- Format code with Prettier
 - `npm run cleanup-browsers`- Detect and clean up orphaned Chrome browser processes
+- `npm test` - Run the unit test suite (fast, no browser needed)
+- `npm run test:watch` - Run unit tests in watch mode during development
+- `npm run test:e2e` - Build, then run end-to-end tests (spawns the real server incl. a headless browser)
 
 ## Troubleshooting
 

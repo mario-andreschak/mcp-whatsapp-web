@@ -94,10 +94,11 @@ export class WhatsAppMcpServer {
         await this.whatsapp.initialize();
         log.info('WhatsApp client initialized successfully.');
       } catch (error) {
+        // initialize() already logged the full error; one line is enough here
         log.error(
           'Failed to initialize WhatsApp client. The MCP server stays up; ' +
-            'check_auth_status and get_qr_code can be used once the issue is resolved.',
-          error,
+            'check_auth_status and get_qr_code can be used once the issue is resolved. ' +
+            (error instanceof Error ? error.message : String(error)),
         );
       }
     })();
@@ -260,9 +261,7 @@ export class WhatsAppMcpServer {
     try {
       // First destroy the WhatsApp client to properly close the Puppeteer browser
       // This will also unregister the browser PID
-      log.info('Destroying WhatsApp client...');
       await this.whatsapp.destroy();
-      log.info('WhatsApp client destroyed successfully');
 
       // Close all active Streamable HTTP sessions
       const sessionIds = Object.keys(this.httpTransports);
