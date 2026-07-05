@@ -1,9 +1,24 @@
 {
   "name": "mcp-whatsapp-web",
   "version": "1.1.0",
+  "mcpName": "io.github.mario-andreschak/mcp-whatsapp-web",
   "description": "TypeScript MCP server for WhatsApp using whatsapp-web.js",
   "main": "dist/index.js",
   "type": "module",
+  "bin": {
+    "mcp-whatsapp-web": "dist/index.js"
+  },
+  "files": [
+    "dist"
+  ],
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/mario-andreschak/mcp-whatsapp-web.git"
+  },
+  "homepage": "https://github.com/mario-andreschak/mcp-whatsapp-web#readme",
+  "bugs": {
+    "url": "https://github.com/mario-andreschak/mcp-whatsapp-web/issues"
+  },
   "scripts": {
     "build": "tsc",
     "start": "node --no-deprecation dist/index.js",
