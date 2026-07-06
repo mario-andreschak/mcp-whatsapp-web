@@ -16,3 +16,5 @@ wheels/
 
 # OAuth client registrations and token hashes
 .oauth-store.json
+.mcpregistry_github_token
+.mcpregistry_registry_token
