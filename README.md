@@ -1,3 +1,8 @@
+# Very Important
+
+Automation of Whatsapp Messages without Meta (Business-)API is against WhatsApp' Terms of Service! 
+You take full responsibility for everything you do with this MCP-Server. It is possible that your account will be flagged/restricted.
+
 # MCP WhatsApp Web (TypeScript)
 
 A Model Context Protocol (MCP) server for WhatsApp Web, implemented in TypeScript. This project is a TypeScript port of the original [whatsapp-mcp](https://github.com/lharries/whatsapp-mcp) repository.
