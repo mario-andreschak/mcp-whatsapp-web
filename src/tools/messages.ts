@@ -1,13 +1,13 @@
 import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import { z } from 'zod';
-import { WhatsAppService } from '../services/whatsapp.js'; // Removed unused SimpleMessage import
+import type { WhatsAppBackend } from '../services/backend.js'; // Removed unused SimpleMessage import
 import { log } from '../utils/logger.js';
 import { CallToolResult } from '@modelcontextprotocol/sdk/types.js';
-import { Message as WWebMessage } from 'whatsapp-web.js'; // Alias to avoid naming conflict
+
 
 export function registerMessageTools(
   server: McpServer,
-  whatsappService: WhatsAppService,
+  whatsappService: WhatsAppBackend,
 ): void {
   log.info('Registering message tools...');
 
@@ -41,7 +41,7 @@ export function registerMessageTools(
     'get_message_by_id',
     'Get a specific WhatsApp message by its ID.',
     {
-        message_id: z.string().describe('The serialized ID of the message (e.g., true_123456789@c.us_ABCDEFGHIJKL)'),
+        message_id: z.string().describe('The opaque message ID returned by list_messages or send_message'),
     },
     async ({ message_id }): Promise<CallToolResult> => {
         try {
@@ -87,7 +87,7 @@ export function registerMessageTools(
         }
 
         // Fetch recent messages from the same chat
-        const recentMessages = await whatsappService.getMessages(targetMessage.to, limit);
+        const recentMessages = await whatsappService.getMessages(targetMessage.chatId ?? (targetMessage.fromMe ? targetMessage.to : targetMessage.from), limit);
 
         // Find the index of the target message
         const targetIndex = recentMessages.findIndex(msg => msg.id === message_id);
@@ -153,12 +153,12 @@ export function registerMessageTools(
     },
     async ({ recipient_jid, message }): Promise<CallToolResult> => {
       try {
-        const sentMessage: WWebMessage = await whatsappService.sendMessage(recipient_jid, message);
+        const sentMessage = await whatsappService.sendMessage(recipient_jid, message);
         // Return confirmation or details of the sent message
         const result = {
           success: true,
           message: 'Message sent successfully.',
-          messageId: sentMessage.id._serialized,
+          messageId: sentMessage.id,
           timestamp: sentMessage.timestamp,
         };
         return {

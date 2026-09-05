@@ -1,204 +1,99 @@
 import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import { z } from 'zod';
-import { WhatsAppService } from '../services/whatsapp.js';
+import type { WhatsAppBackend, SentMessage } from '../services/backend.js';
 import { log } from '../utils/logger.js';
-import { CallToolResult, ImageContent, AudioContent, TextContent } from '@modelcontextprotocol/sdk/types.js';
+import type { CallToolResult, ImageContent, AudioContent, TextContent } from '@modelcontextprotocol/sdk/types.js';
+import { AudioUtils } from '../utils/audio.js';
+import fs from 'node:fs/promises';
+import path from 'node:path';
+import os from 'node:os';
+import { fileTypeFromBuffer } from 'file-type';
 
-// Import the CommonJS module
-import { createRequire } from 'module';
-const require = createRequire(import.meta.url);
-const { MessageMedia } = require('whatsapp-web.js');
+const failure = (message: string): CallToolResult => ({
+  content: [{ type: 'text', text: message }], isError: true,
+});
 
-// Import types
-import type WAWebJS from 'whatsapp-web.js';
-// Using WAWebJS.Message directly instead of alias
-import { AudioUtils } from '../utils/audio.js'; // To be created
-import fs from 'fs';
-import path from 'path';
-import os from 'os';
-import { fileTypeFromBuffer } from 'file-type'; // Need to install file-type
-
-export function registerMediaTools(
-  server: McpServer,
-  whatsappService: WhatsAppService,
-): void {
-  log.info('Registering media tools...');
-
-  // Combined tool for sending various media types
+export function registerMediaTools(server: McpServer, whatsappService: WhatsAppBackend): void {
   server.tool(
     'send_media',
     'Send media (image, video, document, audio) via WhatsApp.',
     {
-      recipient_jid: z.string().describe('The recipient JID (e.g., 123456789@c.us or 123456789-12345678@g.us)'),
+      recipient_jid: z.string().describe('Recipient JID returned by a contact/chat tool; legacy @c.us phone JIDs are also accepted'),
       media_path: z.string().optional().describe('Absolute path to the local media file'),
       media_url: z.string().url().optional().describe('URL of the media file'),
       media_content: z.string().optional().describe('Base64 encoded media content'),
-      mime_type: z.string().optional().describe('MIME type of the media_content (required if using media_content)'),
-      filename: z.string().optional().describe('Filename for the media (recommended if using media_content)'),
+      mime_type: z.string().optional().describe('MIME type (required with media_content)'),
+      filename: z.string().optional().describe('Filename for base64 media'),
       caption: z.string().optional().describe('Optional caption for the media'),
-      as_audio_message: z.boolean().optional().default(false).describe('Send audio specifically as a voice note (requires ffmpeg for conversion if not opus/ogg)'),
-      include_full_data: z.boolean().optional().default(false).describe('Whether to include the full base64 data in the response')
+      as_audio_message: z.boolean().optional().default(false).describe('Convert audio to Opus/Ogg and send a voice note; supports local files and base64'),
+      include_full_data: z.boolean().optional().default(false).describe('Include the input base64 data in the response'),
     },
-    async ({
-      recipient_jid,
-      media_path,
-      media_url,
-      media_content,
-      mime_type,
-      filename,
-      caption,
-      as_audio_message,
-      include_full_data = false,
-    }): Promise<CallToolResult> => {
-      let mediaInput: string | null = null;
-      let inputType: 'path' | 'url' | 'base64' | null = null;
-
-      if (media_path) {
-        mediaInput = media_path;
-        inputType = 'path';
-      } else if (media_url) {
-        mediaInput = media_url;
-        inputType = 'url';
-      } else if (media_content) {
-        if (!mime_type) {
-          return { content: [{ type: 'text', text: 'mime_type is required when using media_content' }], isError: true };
-        }
-        mediaInput = media_content;
-        inputType = 'base64';
+    async ({ recipient_jid, media_path, media_url, media_content, mime_type, filename, caption, as_audio_message, include_full_data }): Promise<CallToolResult> => {
+      if ([media_path, media_url, media_content].filter(Boolean).length !== 1) {
+        return failure('Provide exactly one of media_path, media_url, or media_content.');
+      }
+      if (media_content && !mime_type) return failure('mime_type is required when using media_content');
+      if (as_audio_message && media_url) {
+        return failure('Download the audio URL to a local file first, then use media_path to send a voice note.');
       }
 
-      if (!mediaInput || !inputType) {
-        return { content: [{ type: 'text', text: 'One of media_path, media_url, or media_content must be provided' }], isError: true };
-      }
-
+      let tempDirectory: string | undefined;
+      let convertedPath: string | undefined;
       try {
-        let sentMessage: WAWebJS.Message;
-        let finalMediaPath = media_path; // Keep track of the path used, especially for temp files
-
+        await whatsappService.ensureReady();
+        let sentMessage: SentMessage;
         if (as_audio_message) {
-          // Handle sending as audio message (voice note)
-          log.info(`Attempting to send audio message to ${recipient_jid}`);
-          let audioPath = '';
-          let tempFilePath: string | null = null;
-          let needsCleanup = false;
-
-          if (inputType === 'path') {
-            audioPath = mediaInput;
-          } else if (inputType === 'url') {
-             return { content: [{ type: 'text', text: 'Sending audio message directly from URL is not yet supported. Download first.' }], isError: true };
-             // TODO: Implement download from URL first if needed
-          } else { // base64
-            const buffer = Buffer.from(mediaInput, 'base64');
-            const detectedType = await fileTypeFromBuffer(buffer);
-            const ext = detectedType?.ext || 'bin'; // Fallback extension
-            tempFilePath = path.join(os.tmpdir(), `whatsapp_audio_${Date.now()}.${ext}`);
-            fs.writeFileSync(tempFilePath, buffer);
-            audioPath = tempFilePath;
-            needsCleanup = true;
-            mime_type = detectedType?.mime || mime_type || 'application/octet-stream'; // Use detected type if available
-            filename = filename || `audio.${ext}`;
+          let audioPath = media_path;
+          if (!audioPath) {
+            tempDirectory = await fs.mkdtemp(path.join(os.tmpdir(), 'whatsapp-audio-'));
+            const buffer = Buffer.from(media_content!, 'base64');
+            const detected = await fileTypeFromBuffer(buffer);
+            audioPath = path.join(tempDirectory, `input.${detected?.ext || 'bin'}`);
+            await fs.writeFile(audioPath, buffer);
           }
-
-          if (!audioPath.endsWith('.ogg')) {
-            log.info(`Audio file ${audioPath} is not ogg, attempting conversion...`);
-            try {
-              const convertedPath = await AudioUtils.convertToOpusOggTemp(audioPath);
-              log.info(`Audio converted to ${convertedPath}`);
-              // If original was temp, clean it up now
-              if (needsCleanup && tempFilePath && fs.existsSync(tempFilePath)) {
-                 fs.unlinkSync(tempFilePath);
-              }
-              tempFilePath = convertedPath; // Now the converted file is the temp file
-              needsCleanup = true; // Mark the converted file for cleanup
-              audioPath = convertedPath;
-              finalMediaPath = audioPath; // Update final path
-            } catch (conversionError: any) {
-              log.warn(`Audio conversion failed: ${conversionError.message}. Sending as regular document/audio file.`);
-              // Fallback: Send as regular media without 'ptt' flag
-              const media = inputType === 'base64'
-                ? new MessageMedia(mime_type!, mediaInput, filename)
-                : (inputType === 'path' ? MessageMedia.fromFilePath(mediaInput) : await MessageMedia.fromUrl(mediaInput, { unsafeMime: true })); // Corrected logic: check path or assume URL
-              sentMessage = await whatsappService.getClient().sendMessage(recipient_jid, media, { caption });
-              // Cleanup temp file if created from base64
-              if (needsCleanup && tempFilePath && fs.existsSync(tempFilePath)) {
-                 fs.unlinkSync(tempFilePath);
-              }
-              // Return result for regular media sending
-              const result = { success: true, message: 'Audio sent as regular file (conversion failed).', messageId: sentMessage.id._serialized };
-              return { content: [{ type: 'text', text: JSON.stringify(result, null, 2) }] };
-            }
-          }
-
-          // Send the (potentially converted) ogg file as a voice note
-          const media = MessageMedia.fromFilePath(audioPath);
-          sentMessage = await whatsappService.getClient().sendMessage(recipient_jid, media, { sendAudioAsVoice: true }); // Key option!
-
-          // Cleanup temp file if created
-          if (needsCleanup && tempFilePath && fs.existsSync(tempFilePath)) {
-             fs.unlinkSync(tempFilePath);
-          }
-
+          // An .ogg extension alone does not guarantee the Opus codec.
+          convertedPath = await AudioUtils.convertToOpusOggTemp(audioPath);
+          sentMessage = await whatsappService.sendVoiceNote(recipient_jid, convertedPath);
+        } else if (media_content) {
+          sentMessage = await whatsappService.sendMediaFromBase64(recipient_jid, media_content, mime_type!, filename, caption);
         } else {
-          // Handle sending regular media (image, video, document)
-          log.info(`Sending regular media to ${recipient_jid}`);
-          // Determine finalMediaPath based on inputType
-          if (inputType === 'path') {
-            finalMediaPath = mediaInput;
-          } else {
-            finalMediaPath = undefined; // URL or base64 doesn't have a local path
-          }
-          // The sendMedia method in WhatsAppService handles the different input types (path/url)
-          // For base64, we need to call a different service method
-          if (inputType === 'base64') {
-             sentMessage = await whatsappService.sendMediaFromBase64(recipient_jid, mediaInput, mime_type!, filename, caption);
-          } else {
-             sentMessage = await whatsappService.sendMedia(recipient_jid, mediaInput, caption);
-          }
+          sentMessage = await whatsappService.sendMedia(recipient_jid, (media_path || media_url)!, caption);
         }
 
-        // Create result object with basic info
-        const result: any = {
+        const result: Record<string, unknown> = {
           success: true,
           message: `Media (${as_audio_message ? 'audio message' : 'file'}) sent successfully.`,
-          messageId: sentMessage.id._serialized,
+          messageId: sentMessage.id,
           timestamp: sentMessage.timestamp,
-          filePathUsed: finalMediaPath // Include the path if a local file was ultimately sent
+          filePathUsed: media_path,
         };
-        
-        // If include_full_data is true, include the media content in the result
-        if (include_full_data && mediaInput) {
-          // For base64 input, we already have the data
-          if (inputType === 'base64') {
+        if (include_full_data) {
+          if (media_content) {
             result.mediaData = media_content;
             result.mimeType = mime_type;
-          } 
-          // For path or URL, we need to get the data
-          else if (inputType === 'path' && fs.existsSync(mediaInput)) {
+          } else if (media_path) {
+            // Sending already succeeded; an optional read failure must not invite a duplicate send.
             try {
-              const buffer = fs.readFileSync(mediaInput);
+              const buffer = await fs.readFile(media_path);
               result.mediaData = buffer.toString('base64');
-              
-              // Try to determine mime type
-              const detectedType = await fileTypeFromBuffer(buffer);
-              result.mimeType = detectedType?.mime || 'application/octet-stream';
-            } catch (err) {
-              log.warn(`Could not read file for include_full_data: ${err}`);
+              result.mimeType = (await fileTypeFromBuffer(buffer))?.mime || 'application/octet-stream';
+            } catch (error) {
+              log.warn('Could not read media for include_full_data:', error);
             }
           }
-          // For URL, we don't re-download it to include in the response
         }
-        
-        log.debug('Send media result', JSON.stringify(result));
-        
-        return {
-          content: [{ type: 'text', text: JSON.stringify(result, null, 2) }],
-        };
-      } catch (error: any) {
-        log.error(`Error in send_media tool to ${recipient_jid}:`, error);
-        return {
-          content: [{ type: 'text', text: `Error sending media to ${recipient_jid}: ${error.message}` }],
-          isError: true,
-        };
+        return { content: [{ type: 'text', text: JSON.stringify(result, null, 2) }] };
+      } catch (error) {
+        log.error('Error sending media:', error);
+        return failure(`Error sending media: ${error instanceof Error ? error.message : String(error)}`);
+      } finally {
+        // Only paths created by this invocation are removed; the input file stays intact.
+        if (convertedPath) {
+          await fs.unlink(convertedPath).catch((error: unknown) => log.warn('Could not remove converted audio:', error));
+        }
+        if (tempDirectory) {
+          await fs.rm(tempDirectory, { recursive: true, force: true }).catch((error: unknown) => log.warn('Could not remove temporary audio:', error));
+        }
       }
     },
   );
@@ -207,80 +102,35 @@ export function registerMediaTools(
     'download_media',
     'Download media from a WhatsApp message and return its content.',
     {
-      message_id: z.string().describe('The serialized ID of the message containing the media'),
-      include_full_data: z.boolean().optional().default(false).describe('Whether to include the full base64 data in the response')
+      message_id: z.string().describe('Opaque message ID returned by a message tool'),
+      include_full_data: z.boolean().optional().default(false).describe('Include the full base64 data in the response'),
     },
-    async ({ message_id, include_full_data = false }): Promise<CallToolResult> => {
+    async ({ message_id, include_full_data }): Promise<CallToolResult> => {
       try {
         const media = await whatsappService.downloadMedia(message_id);
-        if (!media) {
-          return {
-            content: [{ type: 'text', text: `Media not found or failed to download for message: ${message_id}` }],
-            isError: true,
-          };
-        }
-
-        // Extract metadata
-        const metadata = {
-          filename: media.filename || 'unknown',
-          mimetype: media.mimetype,
-          filesize: media.filesize || 'unknown'
-        };
-        
-        log.debug('Media metadata', JSON.stringify(metadata));
-
-        // Create a TextContent with metadata as the first item in the content array
-        const metadataContent: TextContent = {
+        if (!media) return failure(`Media not found or unavailable for message: ${message_id}`);
+        const content: Array<TextContent | ImageContent | AudioContent> = [{
           type: 'text',
-          text: JSON.stringify(metadata, null, 2)
-        };
-        
-        // Prepare the array for the response content
-        const contentArray: Array<TextContent | ImageContent | AudioContent> = [metadataContent];
-        
-        // If include_full_data is true, add a second content object with the actual media data
+          text: JSON.stringify({
+            filename: media.filename || 'unknown',
+            mimetype: media.mimetype,
+            filesize: media.filesize ?? Buffer.byteLength(media.data, 'base64'),
+          }, null, 2),
+        }];
         if (include_full_data) {
           if (media.mimetype.startsWith('image/')) {
-            // For images, add an ImageContent
-            contentArray.push({
-              type: 'image',
-              data: media.data,
-              mimeType: media.mimetype,
-            } as unknown as TextContent); // Type assertion to satisfy TypeScript
+            content.push({ type: 'image', data: media.data, mimeType: media.mimetype });
           } else if (media.mimetype.startsWith('audio/')) {
-            // For audio, add an AudioContent
-            contentArray.push({
-              type: 'audio',
-              data: media.data,
-              mimeType: media.mimetype,
-            } as unknown as TextContent); // Type assertion to satisfy TypeScript
+            content.push({ type: 'audio', data: media.data, mimeType: media.mimetype });
           } else {
-            // For videos, documents, etc., add as TextContent
-            contentArray.push({
-              type: 'text',
-              text: `Base64 Data: ${media.data}`
-            });
+            content.push({ type: 'text', text: `Base64 Data: ${media.data}` });
           }
         }
-
-        log.debug('Download media result', JSON.stringify({
-          metadata,
-          hasFullData: include_full_data,
-          mediaType: media.mimetype
-        }));
-
-        return {
-          content: contentArray,
-        };
-      } catch (error: any) {
-        log.error(`Error in download_media tool for message ${message_id}:`, error);
-        return {
-          content: [{ type: 'text', text: `Error downloading media for message ${message_id}: ${error.message}` }],
-          isError: true,
-        };
+        return { content };
+      } catch (error) {
+        log.error('Error downloading media:', error);
+        return failure(`Error downloading media: ${error instanceof Error ? error.message : String(error)}`);
       }
     },
   );
-
-  log.info('Media tools registered.');
 }

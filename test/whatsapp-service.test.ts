@@ -1,9 +1,138 @@
 import { describe, it, expect, vi, afterEach } from 'vitest';
+import { createRequire } from 'node:module';
+import path from 'node:path';
 import { makeService } from './helpers/fake-client.js';
+
+const { MessageMedia } = createRequire(import.meta.url)('whatsapp-web.js');
 
 afterEach(() => {
   vi.useRealTimers();
+  vi.restoreAllMocks();
+  vi.unstubAllEnvs();
   delete process.env.HEALTH_CHECK_INTERVAL_MS;
+});
+
+describe('browser configuration', () => {
+  it('retains the LocalAuth profile and native browser identity with the sandbox enabled', () => {
+    vi.stubEnv('WHATSAPP_SESSION_DIR', '');
+    vi.stubEnv('WHATSAPP_HEADLESS', '');
+    vi.stubEnv('WHATSAPP_NO_SANDBOX', '');
+    const { fake } = makeService();
+    const options = fake().options;
+    expect(options.authStrategy).toMatchObject({ dataPath: path.join(process.cwd(), 'whatsapp-sessions') });
+    expect(options.userAgent).toBe(false);
+    expect(options.puppeteer?.headless).toBe(true);
+    expect(options.puppeteer?.ignoreDefaultArgs).toEqual(['--enable-automation']);
+    expect(options.puppeteer?.args).not.toContain('--no-sandbox');
+    expect(options.puppeteer?.args).not.toContain('--disable-setuid-sandbox');
+    expect(options.puppeteer?.args).not.toContain('--disable-gpu');
+    expect(options.puppeteer?.args).not.toContain('--disable-accelerated-2d-canvas');
+    expect(options.puppeteer?.args).not.toContain('--no-zygote');
+  });
+
+  it('keeps profile overrides on reconnect and honors explicit headed and container options', async () => {
+    vi.useFakeTimers();
+    vi.stubEnv('WHATSAPP_SESSION_DIR', 'test-session-profile');
+    vi.stubEnv('WHATSAPP_HEADLESS', 'false');
+    vi.stubEnv('WHATSAPP_NO_SANDBOX', 'true');
+    const { service, fake, fakes } = makeService();
+    fake().emit('disconnected', 'NAVIGATION');
+    await vi.advanceTimersByTimeAsync(5100);
+    expect(fakes).toHaveLength(2);
+    for (const client of fakes) {
+      expect(client.options.authStrategy).toMatchObject({ dataPath: path.resolve('test-session-profile') });
+      expect(client.options.puppeteer?.headless).toBe(false);
+      expect(client.options.puppeteer?.args).toContain('--no-sandbox');
+      expect(client.options.puppeteer?.args).toContain('--disable-setuid-sandbox');
+    }
+    await service.destroy();
+  });
+});
+
+describe('backend-neutral operations', () => {
+  const outgoing = {
+    id: { _serialized: 'true_123@c.us_SENT' },
+    body: 'hello',
+    from: 'me@c.us',
+    to: '123@c.us',
+    timestamp: 1_700_000_000,
+    fromMe: true,
+    hasMedia: false,
+    type: 'chat',
+  };
+
+  it('exposes backend and history availability across authentication', () => {
+    const { service, fake } = makeService();
+    expect(service.backend).toBe('webjs');
+    expect(service.getStatus()).toMatchObject({ backend: 'webjs', authenticated: false, history: { state: 'unavailable' } });
+    fake().emit('authenticated');
+    expect(service.getStatus().history.state).toBe('syncing');
+    fake().emit('ready');
+    expect(service.getStatus()).toMatchObject({ authenticated: true, history: { state: 'available' } });
+  });
+
+  it('returns opaque string IDs and timestamps for text and media sends', async () => {
+    const { service, fake } = makeService();
+    fake().emit('ready');
+    fake().sendMessage.mockImplementation(async () => outgoing);
+    const expected = { id: outgoing.id._serialized, timestamp: outgoing.timestamp };
+    await expect(service.sendMessage('123@c.us', 'hello')).resolves.toEqual(expected);
+    expect(fake().sendMessage).toHaveBeenLastCalledWith('123@c.us', 'hello');
+
+    await expect(service.sendMediaFromBase64('123@c.us', 'aGVsbG8=', 'text/plain', 'hello.txt', 'caption')).resolves.toEqual(expected);
+    expect(fake().sendMessage).toHaveBeenLastCalledWith('123@c.us', expect.objectContaining({
+      data: 'aGVsbG8=', mimetype: 'text/plain', filename: 'hello.txt',
+    }), { caption: 'caption' });
+
+    const media = new MessageMedia('image/png', 'aGVsbG8=', 'picture.png');
+    vi.spyOn(MessageMedia, 'fromFilePath').mockReturnValue(media);
+    vi.spyOn(MessageMedia, 'fromUrl').mockResolvedValue(media);
+    await expect(service.sendMedia('123@c.us', 'picture.png', 'photo')).resolves.toEqual(expected);
+    await expect(service.sendMedia('123@c.us', 'https://example.com/picture.png', 'photo')).resolves.toEqual(expected);
+    expect(MessageMedia.fromUrl).toHaveBeenCalledWith('https://example.com/picture.png', { unsafeMime: true });
+    expect(fake().sendMessage).toHaveBeenLastCalledWith('123@c.us', media, { caption: 'photo' });
+  });
+
+  it('waits for readiness before reading or sending a voice note', async () => {
+    vi.useFakeTimers();
+    const { service, fake } = makeService();
+    const media = new MessageMedia('audio/ogg', 'aGVsbG8=', 'note.ogg');
+    const readMedia = vi.spyOn(MessageMedia, 'fromFilePath').mockReturnValue(media);
+    fake().sendMessage.mockImplementation(async () => outgoing);
+    const pending = service.sendVoiceNote('123@c.us', 'note.ogg');
+    expect(readMedia).not.toHaveBeenCalled();
+    expect(fake().sendMessage).not.toHaveBeenCalled();
+    fake().emit('ready');
+    await vi.advanceTimersByTimeAsync(250);
+    await expect(pending).resolves.toEqual({ id: outgoing.id._serialized, timestamp: outgoing.timestamp });
+    expect(readMedia).toHaveBeenCalledWith('note.ogg');
+    expect(fake().sendMessage).toHaveBeenCalledWith('123@c.us', media, { sendAudioAsVoice: true });
+  });
+
+  it('preserves chat identity for incoming and outgoing message context', async () => {
+    const { service, fake } = makeService();
+    fake().emit('ready');
+    fake().getMessageById.mockResolvedValue(outgoing);
+    expect(await service.getMessageById(outgoing.id._serialized)).toMatchObject({ chatId: '123@c.us' });
+    fake().getMessageById.mockResolvedValue({ ...outgoing, fromMe: false, from: 'group@g.us', to: 'me@c.us' });
+    expect(await service.getMessageById('incoming')).toMatchObject({ chatId: 'group@g.us' });
+  });
+
+  it('includes the last message when fetching a chat and respects list omission', async () => {
+    const { service, fake } = makeService();
+    fake().emit('ready');
+    const chat = {
+      id: { _serialized: '123@c.us' }, name: 'Alice', isGroup: false,
+      timestamp: outgoing.timestamp, unreadCount: 0, lastMessage: outgoing,
+    };
+    fake().getChatById.mockResolvedValue(chat);
+    fake().getChats.mockResolvedValue([chat]);
+    expect(await service.getChatById('123@c.us')).toMatchObject({
+      lastMessage: { id: outgoing.id._serialized, chatId: '123@c.us', timestamp: outgoing.timestamp },
+    });
+    expect((await service.listChats(20))[0].lastMessage).toMatchObject({ id: outgoing.id._serialized, chatId: '123@c.us' });
+    expect((await service.listChats(20, false))[0].lastMessage).toBeUndefined();
+  });
 });
 
 describe('authentication state machine', () => {

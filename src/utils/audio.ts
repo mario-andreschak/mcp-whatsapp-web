@@ -3,6 +3,7 @@ import { createRequire } from 'module';
 import fs from 'fs';
 import path from 'path';
 import os from 'os';
+import { randomUUID } from 'node:crypto';
 import { log } from './logger.js';
 
 // ffmpeg-static is CommonJS (module.exports = <path string>), so load it via
@@ -56,11 +57,13 @@ export class AudioUtils {
         .audioCodec('libopus')
         .audioBitrate(bitrate)
         .audioFrequency(sampleRate)
+        .audioChannels(1)
         .outputOptions([
           '-application voip', // Optimize for voice
           '-vbr on', // Variable bitrate
           '-compression_level 10', // Max compression
           '-frame_duration 60', // Good frame duration for voice
+          '-avoid_negative_ts make_zero',
         ])
         .output(finalOutputPath)
         .on('end', () => {
@@ -89,7 +92,7 @@ export class AudioUtils {
     bitrate = '32k',
     sampleRate = 24000,
   ): Promise<string> {
-    const tempFileName = `whatsapp_audio_converted_${Date.now()}.ogg`;
+    const tempFileName = `whatsapp_audio_converted_${randomUUID()}.ogg`;
     const tempOutputPath = path.join(os.tmpdir(), tempFileName);
     log.debug(`Converting ${inputPath} to temporary file: ${tempOutputPath}`);
     try {

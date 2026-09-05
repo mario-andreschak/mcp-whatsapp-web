@@ -1,4 +1,4 @@
-import { WhatsAppService } from '../services/whatsapp.js';
+import type { WhatsAppBackend } from '../services/backend.js';
 import qrcode from 'qrcode';
 import { z } from 'zod';
 import { log } from '../utils/logger.js';
@@ -12,9 +12,18 @@ import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
  */
 export function registerAuthTools(
   server: McpServer,
-  whatsappService: WhatsAppService,
+  whatsappService: WhatsAppBackend,
 ): void {
   log.info('Registering authentication tools...');
+
+  server.tool(
+    'get_backend_status',
+    'Report the selected WhatsApp backend, connection status, and available history. Baileys queries cover locally synchronized history; available does not imply a complete archive.',
+    {},
+    async (): Promise<CallToolResult> => ({
+      content: [{ type: 'text', text: JSON.stringify(whatsappService.getStatus(), null, 2) }],
+    }),
+  );
 
   server.tool(
     'get_qr_code',
@@ -68,7 +77,7 @@ export function registerAuthTools(
  * @returns A promise that resolves to the tool result containing the pairing code
  */
 async function requestPairingCode(
-  whatsappService: WhatsAppService,
+  whatsappService: WhatsAppBackend,
   phoneNumber: string
 ): Promise<CallToolResult> {
   try {
@@ -122,10 +131,11 @@ async function requestPairingCode(
  * @returns A promise that resolves to the tool result containing the logout status
  */
 async function logoutFromWhatsApp(
-  whatsappService: WhatsAppService
+  whatsappService: WhatsAppBackend
 ): Promise<CallToolResult> {
   try {
-    if (!whatsappService.isAuthenticated()) {
+    // Baileys may retain credentials while disconnected; explicit logout must clear those too.
+    if (!whatsappService.isAuthenticated() && whatsappService.backend !== 'baileys') {
       log.info('Logout requested but client is not authenticated');
       return {
         content: [
@@ -174,7 +184,7 @@ async function logoutFromWhatsApp(
  * @returns A promise that resolves to the tool result containing the authentication status
  */
 async function checkAuthStatus(
-  whatsappService: WhatsAppService
+  whatsappService: WhatsAppBackend
 ): Promise<CallToolResult> {
   try {
     // On a freshly started server the client may still be restoring its
@@ -189,7 +199,7 @@ async function checkAuthStatus(
 
     let text: string;
     if (isAuthenticated) {
-      text = 'You are currently authenticated with WhatsApp and ready to use all features.';
+      text = 'You are currently authenticated with WhatsApp. Use get_backend_status to check history availability.';
     } else if (pairingCode) {
       text =
         `You are not currently authenticated with WhatsApp. An active pairing code is available: ${pairingCode}\n` +
@@ -224,7 +234,7 @@ async function checkAuthStatus(
  * @returns A promise that resolves to the tool result containing the QR code image
  */
 async function getQrCodeImage(
-  whatsappService: WhatsAppService
+  whatsappService: WhatsAppBackend
 ): Promise<CallToolResult> {
   try {
     const qrString = whatsappService.getLatestQrCode();

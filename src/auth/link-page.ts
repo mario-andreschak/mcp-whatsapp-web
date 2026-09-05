@@ -1,7 +1,7 @@
 import { Router, Request, Response } from 'express';
 import qrcode from 'qrcode';
 import { WhatsAppOAuthProvider } from './oauth-provider.js';
-import { WhatsAppService } from '../services/whatsapp.js';
+import type { WhatsAppBackend } from '../services/backend.js';
 import { log } from '../utils/logger.js';
 
 const TXN_PATTERN = /^[A-Za-z0-9-]{16,64}$/;
@@ -15,7 +15,7 @@ const TXN_PATTERN = /^[A-Za-z0-9-]{16,64}$/;
  */
 export function createLinkRouter(
   provider: WhatsAppOAuthProvider,
-  whatsapp: WhatsAppService,
+  whatsapp: WhatsAppBackend,
 ): Router {
   const router = Router();
 

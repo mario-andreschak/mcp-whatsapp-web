@@ -1,8 +1,8 @@
 {
   "name": "mcp-whatsapp-web",
-  "version": "1.1.0",
+  "version": "1.2.0",
   "mcpName": "io.github.mario-andreschak/mcp-whatsapp-web",
-  "description": "TypeScript MCP server for WhatsApp using whatsapp-web.js",
+  "description": "TypeScript MCP server for WhatsApp using whatsapp-web.js or browserless Baileys",
   "main": "dist/index.js",
   "type": "module",
   "bin": {
@@ -35,12 +35,13 @@
     "mcp",
     "whatsapp",
     "typescript",
-    "whatsapp-web.js"
+    "whatsapp-web.js",
+    "baileys"
   ],
   "author": "",
   "license": "MIT",
   "engines": {
-    "node": ">=20.0.0"
+    "node": ">=22.0.0"
   },
   "dependencies": {
     "@modelcontextprotocol/sdk": "^1.29.0",
@@ -62,6 +63,7 @@
   },
   "devDependencies": {
     "@eslint/js": "^9.39.4",
+    "@types/better-sqlite3": "9.6.0",
     "eslint": "^9.39.4",
     "eslint-config-prettier": "^9.1.0",
     "prettier": "^3.3.2",
@@ -69,7 +71,14 @@
     "vitest": "^4.1.9"
   },
   "allowScripts": {
+    "@whiskeysockets/baileys@7.0.0-rc14": true,
+    "better-sqlite3@12.8.0": true,
     "ffmpeg-static@5.3.0": true,
-    "puppeteer@24.38.0": true
+    "puppeteer@24.38.0": true,
+    "protobufjs@7.6.6": true
+  },
+  "optionalDependencies": {
+    "@whiskeysockets/baileys": "7.0.0-rc14",
+    "better-sqlite3": "12.8.0"
   }
 }

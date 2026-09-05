@@ -1,12 +1,12 @@
 import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import { z } from 'zod';
-import { WhatsAppService } from '../services/whatsapp.js';
+import type { WhatsAppBackend } from '../services/backend.js';
 import { log } from '../utils/logger.js';
 import { CallToolResult } from '@modelcontextprotocol/sdk/types.js';
 
 export function registerContactTools(
   server: McpServer,
-  whatsappService: WhatsAppService,
+  whatsappService: WhatsAppBackend,
 ): void {
   log.info('Registering contact tools...');
 

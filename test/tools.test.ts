@@ -6,11 +6,19 @@ import { registerAuthTools } from '../src/tools/auth.js';
 import { registerChatTools } from '../src/tools/chats.js';
 import { registerContactTools } from '../src/tools/contacts.js';
 import { registerMessageTools } from '../src/tools/messages.js';
-import type { WhatsAppService } from '../src/services/whatsapp.js';
+import type { WhatsAppBackend } from '../src/services/backend.js';
+import { registerMediaTools } from '../src/tools/media.js';
+import { AudioUtils } from '../src/utils/audio.js';
+import fs from 'node:fs/promises';
+import path from 'node:path';
+import os from 'node:os';
 
-/** Duck-typed WhatsAppService covering everything the tool layer calls. */
+/** Driver-neutral fake: deliberately has no browser client or web.js objects. */
 function makeFakeService() {
   return {
+    backend: 'baileys' as const,
+    ensureReady: vi.fn(async () => {}),
+    getStatus: vi.fn(() => ({ backend: 'baileys', authenticated: true, history: { state: 'syncing', note: 'History sync is in progress.' } })),
     isAuthenticated: vi.fn(() => true),
     waitForAuthOutcome: vi.fn(async () => {}),
     getLatestQrCode: vi.fn((): string | null => null),
@@ -24,8 +32,11 @@ function makeFakeService() {
     getChatById: vi.fn(async () => null),
     getMessages: vi.fn(async () => []),
     getMessageById: vi.fn(async () => null),
-    sendMessage: vi.fn(async () => ({ id: { _serialized: 'sent-1' } })),
-    getClient: vi.fn(),
+    sendMessage: vi.fn(async () => ({ id: 'sent-1', timestamp: 123 })),
+    sendMedia: vi.fn(async () => ({ id: 'media-1', timestamp: 124 })),
+    sendMediaFromBase64: vi.fn(async () => ({ id: 'media-2', timestamp: 125 })),
+    sendVoiceNote: vi.fn(async () => ({ id: 'voice-1', timestamp: 126 })),
+    downloadMedia: vi.fn(async () => ({ mimetype: 'image/png', data: 'aGVsbG8=', filename: 'image.png' })),
   };
 }
 type FakeService = ReturnType<typeof makeFakeService>;
@@ -37,11 +48,12 @@ let cleanup: () => Promise<void>;
 beforeEach(async () => {
   fakeService = makeFakeService();
   const server = new McpServer({ name: 'test', version: '0.0.0' });
-  const serviceAsReal = fakeService as unknown as WhatsAppService;
+  const serviceAsReal = fakeService as unknown as WhatsAppBackend;
   registerAuthTools(server, serviceAsReal);
   registerChatTools(server, serviceAsReal);
   registerContactTools(server, serviceAsReal);
   registerMessageTools(server, serviceAsReal);
+  registerMediaTools(server, serviceAsReal);
 
   const [clientTransport, serverTransport] = InMemoryTransport.createLinkedPair();
   client = new Client({ name: 'test-client', version: '0.0.0' });
@@ -54,6 +66,7 @@ beforeEach(async () => {
 
 afterEach(async () => {
   await cleanup();
+  vi.restoreAllMocks();
 });
 
 const text = (result: unknown): string =>
@@ -64,7 +77,7 @@ describe('tool registration', () => {
     const { tools } = await client.listTools();
     const names = tools.map((t) => t.name);
     for (const expected of [
-      'get_qr_code', 'request_pairing_code', 'check_auth_status', 'logout',
+      'get_qr_code', 'request_pairing_code', 'check_auth_status', 'get_backend_status', 'logout',
       'search_contacts', 'list_chats', 'list_messages', 'get_last_interaction', 'send_message',
     ]) {
       expect(names).toContain(expected);
@@ -146,6 +159,23 @@ describe('request_pairing_code', () => {
 });
 
 describe('data tools', () => {
+  it('reports history coverage independently of authentication', async () => {
+    const result = await client.callTool({ name: 'get_backend_status', arguments: {} });
+    expect(JSON.parse(text(result))).toMatchObject({ backend: 'baileys', history: { state: 'syncing' } });
+  });
+
+  it('keeps send_message output compatible with normalized provider results', async () => {
+    const result = await client.callTool({ name: 'send_message', arguments: { recipient_jid: '123@lid', message: 'Hello' } });
+    expect(JSON.parse(text(result))).toMatchObject({ success: true, messageId: 'sent-1', timestamp: 123 });
+    expect(fakeService.sendMessage).toHaveBeenCalledWith('123@lid', 'Hello');
+  });
+
+  it('uses the actual incoming group chat for message context', async () => {
+    fakeService.getMessageById.mockResolvedValue({ id: 'incoming', chatId: 'group@g.us', from: 'sender@lid', to: 'me@s.whatsapp.net', fromMe: false } as never);
+    await client.callTool({ name: 'get_message_context', arguments: { message_id: 'incoming', limit: 7 } });
+    expect(fakeService.getMessages).toHaveBeenCalledWith('group@g.us', 7);
+  });
+
   it('list_chats returns the service data as JSON', async () => {
     fakeService.listChats.mockResolvedValue([
       { id: '1@c.us', name: 'Alice', isGroup: false, unreadCount: 0, timestamp: 1 },
@@ -169,5 +199,60 @@ describe('data tools', () => {
     expect(fakeService.logout).toHaveBeenCalled();
     expect(fakeService.initialize).toHaveBeenCalled();
     expect(text(result)).toMatch(/logged out/i);
+  });
+
+  it('explicit logout clears a disconnected Baileys session too', async () => {
+    fakeService.isAuthenticated.mockReturnValue(false);
+    const result = await client.callTool({ name: 'logout', arguments: {} });
+    expect(fakeService.logout).toHaveBeenCalled();
+    expect(fakeService.initialize).toHaveBeenCalled();
+    expect(result.isError).toBe(false);
+  });
+});
+
+describe('backend-neutral media tools', () => {
+  it('sends base64 through the provider without constructing web.js media', async () => {
+    const result = await client.callTool({ name: 'send_media', arguments: {
+      recipient_jid: '123@lid', media_content: 'aGVsbG8=', mime_type: 'text/plain', filename: 'hello.txt',
+    } });
+    expect(JSON.parse(text(result))).toMatchObject({ success: true, messageId: 'media-2' });
+    expect(fakeService.sendMediaFromBase64).toHaveBeenCalledWith('123@lid', 'aGVsbG8=', 'text/plain', 'hello.txt', undefined);
+  });
+
+  it('does not send ambiguous media inputs', async () => {
+    const result = await client.callTool({ name: 'send_media', arguments: {
+      recipient_jid: '123@lid', media_path: '/audio.ogg', media_content: 'aGVsbG8=', mime_type: 'audio/ogg',
+    } });
+    expect(result.isError).toBe(true);
+    expect(fakeService.sendMedia).not.toHaveBeenCalled();
+    expect(fakeService.sendMediaFromBase64).not.toHaveBeenCalled();
+  });
+
+  it('preserves download image content and metadata across providers', async () => {
+    const result = await client.callTool({ name: 'download_media', arguments: { message_id: 'opaque-id', include_full_data: true } });
+    expect(JSON.parse(text(result))).toMatchObject({ filename: 'image.png', filesize: 5 });
+    expect(result.content).toContainEqual({ type: 'image', data: 'aGVsbG8=', mimeType: 'image/png' });
+  });
+
+  it('cleans converted voice audio after failed sending and keeps the original file', async () => {
+    const directory = await fs.mkdtemp(path.join(os.tmpdir(), 'whatsapp-media-test-'));
+    const original = path.join(directory, 'original.ogg');
+    const converted = path.join(directory, 'converted.ogg');
+    await fs.writeFile(original, 'original');
+    await fs.writeFile(converted, 'converted');
+    vi.spyOn(AudioUtils, 'convertToOpusOggTemp').mockResolvedValue(converted);
+    fakeService.sendVoiceNote.mockRejectedValue(new Error('Socket closed'));
+    try {
+      const result = await client.callTool({ name: 'send_media', arguments: {
+        recipient_jid: '123@lid', media_path: original, as_audio_message: true,
+      } });
+      expect(result.isError).toBe(true);
+      expect(fakeService.sendVoiceNote).toHaveBeenCalledWith('123@lid', converted);
+      expect(await fs.readFile(original, 'utf8')).toBe('original');
+      await expect(fs.access(converted)).rejects.toThrow();
+      expect(fakeService.sendMedia).not.toHaveBeenCalled();
+    } finally {
+      await fs.rm(directory, { recursive: true, force: true });
+    }
   });
 });

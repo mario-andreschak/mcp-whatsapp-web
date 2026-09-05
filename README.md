@@ -20,7 +20,7 @@ With this MCP server, you can:
 ## Features
 
 - **TypeScript Implementation**: Fully typed codebase for better developer experience and code reliability
-- **WhatsApp Web Integration**: Uses [whatsapp-web.js](https://github.com/pedroslopez/whatsapp-web.js) for direct connection to WhatsApp Web
+- **Selectable WhatsApp Backend**: Uses [whatsapp-web.js](https://github.com/pedroslopez/whatsapp-web.js) by default, with an optional [Baileys](https://github.com/WhiskeySockets/Baileys) backend that runs without a browser
 - **MCP Server**: Implements the [Model Context Protocol](https://modelcontextprotocol.io/) for seamless integration with AI assistants
 - **Media Support**: Send and receive images, videos, documents, and audio messages
 - **Multiple Transport Options**: Supports stdio and Streamable HTTP transports — even both at once from a single process (start with stdio and set `MCP_HTTP_PORT` to additionally expose `http://127.0.0.1:<port>/mcp`, or run HTTP-only with `--http`)
@@ -31,14 +31,15 @@ With this MCP server, you can:
 This MCP server consists of:
 
 1. **TypeScript MCP Server**: Implements the Model Context Protocol to provide standardized tools for AI assistants to interact with WhatsApp
-2. **WhatsApp Web Service**: Connects to WhatsApp Web via whatsapp-web.js, handles authentication, and manages message sending/receiving
+2. **WhatsApp Backend**: A shared service interface selects web.js/Puppeteer or Baileys/WebSocket, handles authentication, and manages message sending/receiving
 3. **Tool Implementations**: Provides various tools for contacts, chats, messages, media, and authentication
 
 ## Prerequisites
 
-- Node.js >= 20.0.0
+- Node.js >= 22.0.0 (Node 22 or 24 recommended for the Baileys SQLite dependency)
 - npm or yarn
-- Google Chrome or Microsoft Edge (auto-detected; only needed for sending videos/GIFs — everything else works with the Chromium that puppeteer downloads automatically)
+- For the default `webjs` backend: Google Chrome or Microsoft Edge (auto-detected; needed for video/GIF codec support; other operations can use Puppeteer's bundled Chromium)
+- For `baileys`: install optional dependencies, including the native `better-sqlite3` module. No Chrome, Edge, or Chromium is needed at runtime.
 
 FFmpeg is bundled automatically via the `ffmpeg-static` npm package — no manual installation needed. You can point the `FFMPEG_PATH` environment variable at your own binary to override it.
 
@@ -73,7 +74,41 @@ FFmpeg is bundled automatically via the `ffmpeg-static` npm package — no manua
    cp .env.example .env
    ```
 
-   You can adjust logging levels, pin the WhatsApp Web version, or override the auto-detected browser (`BROWSER_EXECUTABLE_PATH`) and ffmpeg binary (`FFMPEG_PATH`) if needed. `WHATSAPP_HEADLESS=false` shows the browser window (debugging aid), and `WHATSAPP_SESSION_DIR` relocates the session/browser-profile directory (useful for running multiple instances or isolated test runs).
+   You can select the backend with `WHATSAPP_BACKEND`, adjust logging levels, pin the WhatsApp Web version, or override the auto-detected browser (`BROWSER_EXECUTABLE_PATH`) and ffmpeg binary (`FFMPEG_PATH`). `WHATSAPP_HEADLESS=false` shows the web.js browser window, and `WHATSAPP_SESSION_DIR` relocates its persistent profile. Use an absolute session directory to keep it consistent across working directories.
+
+### Choosing a backend
+
+`WHATSAPP_BACKEND=webjs` is the default and preserves existing sessions and MCP tool names. It uses a dedicated persistent `LocalAuth` profile, not your personal Chrome profile. It now keeps the browser's native user agent and graphics defaults, omits Puppeteer's automation banner flag, and leaves the browser sandbox enabled. Containers that require disabling the sandbox can explicitly set `WHATSAPP_NO_SANDBOX=true`. These settings do not guarantee that automation is undetectable.
+
+To use the optional Baileys backend, set these variables in your MCP client configuration or `.env`, then restart the server:
+
+```dotenv
+WHATSAPP_BACKEND=baileys
+BAILEYS_SESSION_DIR=C:/path/to/your/baileys-sessions
+```
+
+`BAILEYS_SESSION_DIR` defaults to `<working directory>/baileys-sessions`; the example above should be replaced with your own absolute directory. Pair this backend separately with `get_qr_code` or `request_pairing_code`. The existing `WHATSAPP_PAIRING_PHONE_NUMBER` option also works. Baileys cannot reuse the web.js browser profile. You can switch back to `webjs` and resume its existing session.
+
+Baileys and SQLite are pinned optional dependencies installed by normal `npm install`. If your package manager omitted them, run `npm install --include=optional`. SQLite uses a native addon; a supported prebuilt binary or a local native build toolchain is required. To avoid downloading Chromium when installing for Baileys or an existing system browser, use:
+
+```powershell
+$env:PUPPETEER_SKIP_DOWNLOAD = 'true'
+npm install --include=optional
+npm run build
+```
+
+On macOS/Linux, the equivalent installation command is `PUPPETEER_SKIP_DOWNLOAD=true npm install --include=optional`. Selecting Baileys loads only its driver and never starts or cleans up browser processes. An unavailable backend produces an error; it never silently switches drivers or retries a send through another backend.
+
+### Baileys sessions and history
+
+- Credentials, Signal keys, contacts, chats and messages persist in `BAILEYS_SESSION_DIR/session.sqlite`. Keep the whole directory private and out of version control. Only one running server may own a session directory. Use separate directories for independent accounts.
+- Normal shutdown preserves the session. Explicit logout or invalid authentication clears the Baileys credentials and cached account data, and revokes its OAuth access tokens. Baileys HTTP OAuth state is stored separately from web.js in `BAILEYS_SESSION_DIR/oauth-store.json`.
+- `get_backend_status` reports the active backend, authentication, stored record counts and history synchronization state. Being connected does not mean history has finished arriving. An `available` history state means local data is available, not that WhatsApp supplied a complete archive.
+- Contact and history tools query the local synchronized store. Initial full-history sync is requested and can take time on large accounts. `list_messages` may request up to 100 additional older messages when a known chat has fewer than requested, with a bounded wait and a per-chat cooldown. Late history batches are persisted for subsequent queries. WhatsApp may still supply only part of an account's history.
+- Treat returned message IDs as opaque and use IDs from the active backend. Legacy `@c.us` phone-number inputs, `@s.whatsapp.net`, groups and `@lid` identifiers are supported; known LID/phone mappings are persisted. Message IDs from web.js cannot be passed to Baileys or vice versa.
+- Text, media, downloads, voice notes and the existing authentication tools use the same MCP interface. Voice-note inputs must be local files or base64; FFmpeg converts them to mono Opus/Ogg before sending. If conversion fails, the tool reports an error without sending a different message type.
+
+The Baileys backend is opt-in and pinned to `7.0.0-rc14`. Review upstream changes before upgrading, especially authentication and message-format migrations. See the [Baileys documentation](https://baileys.wiki/) and [release history](https://github.com/WhiskeySockets/Baileys/releases).
 
 ### Installation with FLUJO
 

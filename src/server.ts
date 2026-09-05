@@ -12,7 +12,8 @@ import express, { Request, Response, RequestHandler } from 'express';
 import path from 'path';
 import { WhatsAppOAuthProvider } from './auth/oauth-provider.js';
 import { createLinkRouter } from './auth/link-page.js';
-import { WhatsAppService } from './services/whatsapp.js';
+import type { WhatsAppBackend } from './services/backend.js';
+import { createWhatsAppBackend } from './services/backend-factory.js';
 import { log } from './utils/logger.js';
 import { BrowserProcessManager } from './utils/browser-process-manager.js';
 // Import tool registration functions
@@ -24,22 +25,23 @@ import { registerAuthTools } from './tools/auth.js';
 
 const SERVER_INFO: Implementation = {
   name: 'mcp-whatsapp-web',
-  version: '1.1.0', // Keep in sync with package.json
+  version: '1.2.0', // Keep in sync with package.json
 };
 
 export type TransportType = 'stdio' | 'http';
 
 export class WhatsAppMcpServer {
-  private readonly whatsapp: WhatsAppService;
-  private browserProcessManager: BrowserProcessManager;
+  private whatsapp!: WhatsAppBackend;
+  private browserProcessManager?: BrowserProcessManager;
   // One transport (each with its own McpServer facade) per Streamable HTTP session.
   // They all share the single WhatsAppService instance and thus the same WhatsApp session.
   private httpTransports: { [sessionId: string]: StreamableHTTPServerTransport } = {};
   private httpServer: ReturnType<express.Express['listen']> | null = null;
+  private stopping = false;
+  private shutdownPromise?: Promise<void>;
 
-  constructor() {
-    this.browserProcessManager = new BrowserProcessManager();
-    this.whatsapp = new WhatsAppService();
+  constructor(whatsapp?: WhatsAppBackend) {
+    if (whatsapp) this.whatsapp = whatsapp;
   }
 
   /**
@@ -69,6 +71,17 @@ export class WhatsAppMcpServer {
   }
 
   async start(transportType: TransportType = 'stdio') {
+    if (this.stopping) return;
+    const backend = this.whatsapp ?? await createWhatsAppBackend();
+    if (this.stopping) {
+      await backend.destroy();
+      return;
+    }
+    this.whatsapp = backend;
+    if (this.whatsapp.backend === 'webjs') {
+      this.browserProcessManager = new BrowserProcessManager();
+    }
+    log.info(`Using WhatsApp backend: ${this.whatsapp.backend}`);
     // Connect the MCP transport first so the server is responsive immediately.
     // The WhatsApp client (browser launch, QR/session restore) initializes in
     // the background; tools report a clear error until it is ready, and
@@ -84,11 +97,17 @@ export class WhatsAppMcpServer {
       await this.startHttpTransport(Number(process.env.MCP_HTTP_PORT || 3001));
     }
 
+    if (this.stopping) {
+      await this.closeTransports();
+      return;
+    }
+
     log.info('Initializing WhatsApp client in the background...');
     void (async () => {
       try {
         // Clean up any orphaned browser processes before starting
-        await this.browserProcessManager.cleanupOrphanedProcesses();
+        await this.browserProcessManager?.cleanupOrphanedProcesses();
+        if (this.stopping) return;
 
         // Initialize the WhatsApp client
         await this.whatsapp.initialize();
@@ -150,7 +169,9 @@ export class WhatsAppMcpServer {
       const mcpUrl = new URL('/mcp', issuerUrl);
       const provider = new WhatsAppOAuthProvider(
         this.whatsapp,
-        path.join(process.cwd(), '.oauth-store.json'),
+        this.whatsapp.backend === 'baileys'
+          ? path.resolve(process.env.BAILEYS_SESSION_DIR || path.join(process.cwd(), 'baileys-sessions'), 'oauth-store.json')
+          : path.join(process.cwd(), '.oauth-store.json'),
       );
       // Unlinking WhatsApp (logout / auth failure) revokes all tokens, so
       // clients get a 401 and automatically re-run the browser flow.
@@ -256,43 +277,46 @@ export class WhatsAppMcpServer {
    * @returns A promise that resolves when shutdown is complete
    */
   async shutdown(): Promise<void> {
+    this.stopping = true;
+    this.shutdownPromise ??= this.doShutdown();
+    return this.shutdownPromise;
+  }
+
+  private async doShutdown(): Promise<void> {
     log.info('Shutting down WhatsApp MCP Server...');
-
     try {
-      // First destroy the WhatsApp client to properly close the Puppeteer browser
-      // This will also unregister the browser PID
-      await this.whatsapp.destroy();
-
-      // Close all active Streamable HTTP sessions
-      const sessionIds = Object.keys(this.httpTransports);
-      if (sessionIds.length > 0) {
-        log.info(`Closing ${sessionIds.length} active HTTP sessions...`);
-        for (const sessionId of sessionIds) {
-          try {
-            await this.httpTransports[sessionId]?.close();
-          } catch (error) {
-            log.warn(`Error closing HTTP session ${sessionId}:`, error);
-          }
-          delete this.httpTransports[sessionId];
-        }
-      }
-      if (this.httpServer) {
-        this.httpServer.close();
-        this.httpServer = null;
-      }
-
+      // Close the active driver and flush its persistent session state.
+      await this.whatsapp?.destroy();
+    } finally {
+      await this.closeTransports();
       // Final check for any orphaned processes that might have been missed
       try {
-        await this.browserProcessManager.cleanupOrphanedProcesses();
+        await this.browserProcessManager?.cleanupOrphanedProcesses();
       } catch (cleanupError) {
         log.warn('Error during final browser process cleanup:', cleanupError);
         // Continue with shutdown even if cleanup fails
       }
 
-      log.info('Server shutdown completed successfully');
-    } catch (error) {
-      log.error('Error during server shutdown:', error);
-      throw error;
+    }
+    log.info('Server shutdown completed successfully');
+  }
+
+  private async closeTransports(): Promise<void> {
+    for (const sessionId of Object.keys(this.httpTransports)) {
+      try {
+        await this.httpTransports[sessionId]?.close();
+      } catch (error) {
+        log.warn(`Error closing HTTP session ${sessionId}:`, error);
+      }
+      delete this.httpTransports[sessionId];
+    }
+    const httpServer = this.httpServer;
+    this.httpServer = null;
+    if (httpServer) {
+      await new Promise<void>((resolve) => {
+        httpServer.close(() => resolve());
+        httpServer.closeAllConnections();
+      });
     }
   }
 }

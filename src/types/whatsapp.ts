@@ -5,7 +5,7 @@ export type {
   SimpleChat,
   SimpleContact,
   SimpleMessage,
-} from '../services/whatsapp.js';
+} from '../services/backend.js';
 
 // You could add more specific types here, for example:
 export interface MediaDownloadResult {

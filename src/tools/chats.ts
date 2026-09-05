@@ -1,12 +1,12 @@
 import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import { z } from 'zod';
-import { WhatsAppService } from '../services/whatsapp.js';
+import type { WhatsAppBackend } from '../services/backend.js';
 import { log } from '../utils/logger.js';
 import { CallToolResult } from '@modelcontextprotocol/sdk/types.js';
 
 export function registerChatTools(
   server: McpServer,
-  whatsappService: WhatsAppService,
+  whatsappService: WhatsAppBackend,
 ): void {
   log.info('Registering chat tools...');
 
@@ -98,7 +98,7 @@ export function registerChatTools(
         log.error(`Error in get_direct_chat_by_contact_number tool for number ${phone_number}:`, error);
         // Don't expose detailed errors, just indicate not found
          return {
-            content: [{ type: 'text', text: `Could not find direct chat for number: ${phone_number}` }],
+            content: [{ type: 'text', text: `Could not find direct chat for number ${phone_number}: ${error.message}` }],
             isError: true,
           };
       }

@@ -16,44 +16,16 @@ import { log } from '../utils/logger.js';
 import path from 'path';
 import { BrowserProcessManager } from '../utils/browser-process-manager.js';
 import { findBrowserExecutable } from '../utils/browser-finder.js';
-
-// Define custom types or interfaces if needed, mapping from whatsapp-web.js types
-// For now, we'll use whatsapp-web.js types directly where possible,
-// but map them to simpler structures for MCP tools if necessary.
-
-export interface SimpleContact {
-  id: string; // JID
-  name: string | null;
-  pushname: string;
-  isMe: boolean;
-  isUser: boolean;
-  isGroup: boolean;
-  isWAContact: boolean;
-  isMyContact: boolean;
-  number: string;
-}
-
-export interface SimpleChat {
-  id: string; // JID
-  name: string;
-  isGroup: boolean;
-  lastMessage?: SimpleMessage; // Optional: Include last message details
-  unreadCount: number;
-  timestamp: number;
-}
-
-export interface SimpleMessage {
-  id: string;
-  body: string;
-  from: string; // Sender JID
-  to: string; // Receiver JID (chat JID)
-  timestamp: number;
-  fromMe: boolean;
-  hasMedia: boolean;
-  mediaKey?: string;
-  type: string; // e.g., 'chat', 'image', 'video', 'ptt'
-  // Add more fields as needed
-}
+import type {
+  BackendStatus,
+  MediaData,
+  SentMessage,
+  SimpleChat,
+  SimpleContact,
+  SimpleMessage,
+  WhatsAppBackend,
+} from './backend.js';
+export type { SimpleChat, SimpleContact, SimpleMessage } from './backend.js';
 
 /** Injectable dependencies, used by tests to substitute fakes. */
 export interface WhatsAppServiceDeps {
@@ -62,7 +34,8 @@ export interface WhatsAppServiceDeps {
   browserProcessManager?: BrowserProcessManager;
 }
 
-export class WhatsAppService {
+export class WhatsAppService implements WhatsAppBackend {
+  readonly backend = 'webjs' as const;
   private client: WAWebJS.Client;
   private readonly clientFactory?: (options: WAWebJS.ClientOptions) => WAWebJS.Client;
   private isInitialized = false;
@@ -103,18 +76,21 @@ export class WhatsAppService {
       authStrategy: new LocalAuth({
         dataPath: this.sessionDataPath, // Project root by default; WHATSAPP_SESSION_DIR overrides
       }),
+      // web.js accepts false at runtime to retain the installed browser's real
+      // user agent. Its type declaration still only allows strings.
+      userAgent: false as unknown as string,
       puppeteer: {
         // WHATSAPP_HEADLESS=false shows the browser window (debugging aid)
         headless: process.env.WHATSAPP_HEADLESS !== 'false',
+        ignoreDefaultArgs: ['--enable-automation'],
         args: [
-          '--no-sandbox',
-          '--disable-setuid-sandbox',
-          '--disable-dev-shm-usage',
-          '--disable-accelerated-2d-canvas',
           '--no-first-run',
-          '--no-zygote',
-          // '--single-process', // Might be needed on some systems
-          '--disable-gpu',
+          ...(process.platform === 'linux' ? ['--disable-dev-shm-usage'] : []),
+          // Some containers require this; ordinary desktop sessions retain
+          // Chromium's sandbox and normal rendering defaults.
+          ...(process.env.WHATSAPP_NO_SANDBOX === 'true'
+            ? ['--no-sandbox', '--disable-setuid-sandbox']
+            : []),
         ],
         // Chrome/Edge is needed for video/gif sending, as the Chromium bundled
         // with puppeteer doesn't support H.264/AAC codecs.
@@ -146,6 +122,12 @@ export class WhatsAppService {
 
   private createClient(): WAWebJS.Client {
     const options = this.buildClientOptions();
+    log.info('WhatsApp browser configuration:', {
+      headless: options.puppeteer?.headless,
+      executablePath: options.puppeteer?.executablePath ?? 'bundled Chromium',
+      persistentProfile: true,
+      sandbox: process.env.WHATSAPP_NO_SANDBOX !== 'true',
+    });
     const client = this.clientFactory ? this.clientFactory(options) : new Client(options);
     this.setupEventHandlers(client);
     this.registeredBrowserPid = null; // A new client means a new browser
@@ -677,6 +659,17 @@ export class WhatsAppService {
     return this.isInitialized;
   }
 
+  getStatus(): BackendStatus {
+    return {
+      backend: this.backend,
+      authenticated: this.isAuthenticated(),
+      history: {
+        state: this.isInitialized ? 'available' : this.isAuthenticating ? 'syncing' : 'unavailable',
+        note: 'History is read from the linked WhatsApp Web browser session; older messages may not be available.',
+      },
+    };
+  }
+
   // --- Wrapper Methods for WhatsApp Functionality ---
 
   // Note: WWebContact and WWebChat aliases are removed from imports, use Contact and Chat directly
@@ -705,38 +698,23 @@ export class WhatsAppService {
 
      const limitedChats = chats.slice(0, limit);
 
-     const simpleChats: SimpleChat[] = [];
-     for (const chat of limitedChats) {
-         let lastMsg: SimpleMessage | undefined = undefined;
-         if (includeLastMessage && chat.lastMessage) {
-             // Fetch the full last message object if needed, or use the partial info
-             // For simplicity, we might just use the available info or fetch it
-             // const fullLastMessage = await this.client.getMessageById(chat.lastMessage.id._serialized);
-             // if (fullLastMessage) {
-             //     lastMsg = this.mapMessageToSimpleMessage(fullLastMessage);
-             // }
-             // Or map the partial info directly if sufficient
-             lastMsg = {
-                 id: chat.lastMessage.id._serialized,
-                 body: chat.lastMessage.body,
-                 from: chat.lastMessage.from,
-                 to: chat.lastMessage.to,
-                 timestamp: chat.lastMessage.timestamp,
-                 fromMe: chat.lastMessage.fromMe,
-                 hasMedia: chat.lastMessage.hasMedia,
-                 type: chat.lastMessage.type,
-             };
-         }
-         simpleChats.push(this.mapChatToSimpleChat(chat, lastMsg));
-     }
-     return simpleChats;
+     return limitedChats.map((chat) => this.mapChatToSimpleChat(
+       chat,
+       includeLastMessage && chat.lastMessage
+         ? this.mapMessageToSimpleMessage(chat.lastMessage)
+         : undefined,
+     ));
   }
 
   async getChatById(chatId: string): Promise<SimpleChat | null> {
     await this.ensureReady();
     try {
       const chat = await this.client.getChatById(chatId);
-      return this.mapChatToSimpleChat(chat);
+      if (!chat) return null;
+      return this.mapChatToSimpleChat(
+        chat,
+        chat.lastMessage ? this.mapMessageToSimpleMessage(chat.lastMessage) : undefined,
+      );
     } catch (error: any) { // Add type any
       log.warn(`Chat not found: ${chatId}`, error);
       return null;
@@ -778,13 +756,13 @@ export class WhatsAppService {
      }
   }
 
-  async sendMessage(to: string, content: string): Promise<WAWebJS.Message> {
+  async sendMessage(to: string, content: string): Promise<SentMessage> {
     await this.ensureReady();
     log.info(`Sending message to ${to}`);
-    return this.client.sendMessage(to, content);
+    return this.mapSentMessage(await this.client.sendMessage(to, content));
   }
 
-  async sendMedia(to: string, mediaPathOrUrl: string, caption?: string): Promise<WAWebJS.Message> {
+  async sendMedia(to: string, mediaPathOrUrl: string, caption?: string): Promise<SentMessage> {
     await this.ensureReady();
     log.info(`Sending media from ${mediaPathOrUrl} to ${to}`);
     let media: WAWebJS.MessageMedia;
@@ -793,17 +771,23 @@ export class WhatsAppService {
     } else {
       media = MessageMedia.fromFilePath(mediaPathOrUrl);
     }
-    return this.client.sendMessage(to, media, { caption });
+    return this.mapSentMessage(await this.client.sendMessage(to, media, { caption }));
   }
 
-   async sendMediaFromBase64(to: string, base64Data: string, mimeType: string, filename?: string, caption?: string): Promise<WAWebJS.Message> {
+  async sendMediaFromBase64(to: string, base64Data: string, mimeType: string, filename?: string, caption?: string): Promise<SentMessage> {
     await this.ensureReady();
     log.info(`Sending media from base64 to ${to}`);
     const media = new MessageMedia(mimeType, base64Data, filename);
-    return this.client.sendMessage(to, media, { caption });
+    return this.mapSentMessage(await this.client.sendMessage(to, media, { caption }));
   }
 
-  async downloadMedia(messageId: string): Promise<WAWebJS.MessageMedia | null> {
+  async sendVoiceNote(to: string, audioPath: string): Promise<SentMessage> {
+    await this.ensureReady();
+    const media = MessageMedia.fromFilePath(audioPath);
+    return this.mapSentMessage(await this.client.sendMessage(to, media, { sendAudioAsVoice: true }));
+  }
+
+  async downloadMedia(messageId: string): Promise<MediaData | null> {
     await this.ensureReady();
     try {
       const message = await this.client.getMessageById(messageId);
@@ -821,6 +805,10 @@ export class WhatsAppService {
   }
 
   // --- Helper Mappers ---
+
+  private mapSentMessage(message: WAWebJS.Message): SentMessage {
+    return { id: message.id._serialized, timestamp: message.timestamp };
+  }
 
   private mapContactToSimpleContact(contact: WAWebJS.Contact): SimpleContact {
     return {
@@ -850,6 +838,7 @@ export class WhatsAppService {
   private mapMessageToSimpleMessage(message: WAWebJS.Message): SimpleMessage {
     return {
       id: message.id._serialized,
+      chatId: message.fromMe ? message.to : message.from,
       body: message.body,
       from: message.from,
       to: message.to,

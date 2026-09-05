@@ -2,7 +2,7 @@
   "$schema": "https://static.modelcontextprotocol.io/schemas/2025-12-11/server.schema.json",
   "name": "io.github.mario-andreschak/mcp-whatsapp-web",
   "title": "WhatsApp Web MCP Server",
-  "description": "MCP server for WhatsApp via whatsapp-web.js: send/receive messages, media, chats, groups, contacts",
+  "description": "WhatsApp MCP via web.js or browserless Baileys: messages, media, chats, groups and contacts",
   "repository": {
     "url": "https://github.com/mario-andreschak/mcp-whatsapp-web",
     "source": "github"
@@ -15,18 +15,32 @@
       "sizes": ["391x389"]
     }
   ],
-  "version": "1.1.0",
+  "version": "1.2.0",
   "packages": [
     {
       "registryType": "npm",
       "registryBaseUrl": "https://registry.npmjs.org",
       "identifier": "mcp-whatsapp-web",
-      "version": "1.1.0",
+      "version": "1.2.0",
       "runtimeHint": "npx",
       "transport": {
         "type": "stdio"
       },
       "environmentVariables": [
+        {
+          "name": "WHATSAPP_BACKEND",
+          "description": "WhatsApp backend: webjs uses a persistent browser profile; baileys connects without a browser and requires separate pairing",
+          "isRequired": false,
+          "format": "string",
+          "default": "webjs",
+          "choices": ["webjs", "baileys"]
+        },
+        {
+          "name": "BAILEYS_SESSION_DIR",
+          "description": "Baileys credentials and synchronized history directory (default: <working directory>/baileys-sessions). Use a private absolute path, owned by one server process.",
+          "isRequired": false,
+          "format": "filepath"
+        },
         {
           "name": "LOG_LEVEL",
           "description": "Log level for the log file (logs/mcp-whatsapp.log)",
@@ -45,19 +59,26 @@
         },
         {
           "name": "WHATSAPP_HEADLESS",
-          "description": "Set to false to show the browser window instead of running headless (debugging aid)",
+          "description": "webjs only: set to false to show the browser window instead of running headless",
           "isRequired": false,
           "format": "boolean"
         },
         {
+          "name": "WHATSAPP_NO_SANDBOX",
+          "description": "webjs only: explicitly disable the browser sandbox for containers that require it. The sandbox is enabled by default.",
+          "isRequired": false,
+          "format": "boolean",
+          "default": "false"
+        },
+        {
           "name": "BROWSER_EXECUTABLE_PATH",
-          "description": "Browser executable. Chrome and Edge are auto-detected in their standard install locations; set this only to use a specific browser. A real Chrome/Edge is required for sending videos and GIFs.",
+          "description": "webjs only: browser executable. Chrome and Edge are auto-detected; set this to use a specific browser. Chrome/Edge is required for sending videos and GIFs.",
           "isRequired": false,
           "format": "filepath"
         },
         {
           "name": "WHATSAPP_SESSION_DIR",
-          "description": "Where the WhatsApp session (browser profile) is stored (default: <working directory>/whatsapp-sessions)",
+          "description": "webjs only: persistent browser profile directory (default: <working directory>/whatsapp-sessions)",
           "isRequired": false,
           "format": "filepath"
         },
@@ -75,13 +96,13 @@
         },
         {
           "name": "WA_WEB_VERSION",
-          "description": "Pin the WhatsApp Web version. Only set this if a WhatsApp-side update breaks the client.",
+          "description": "webjs only: pin the WhatsApp Web version if a WhatsApp-side update breaks the client.",
           "isRequired": false,
           "format": "string"
         },
         {
           "name": "HEALTH_CHECK_INTERVAL_MS",
-          "description": "Connection health check interval in milliseconds (<=0 disables)",
+          "description": "webjs only: connection health check interval in milliseconds (<=0 disables)",
           "isRequired": false,
           "format": "number",
           "default": "60000"

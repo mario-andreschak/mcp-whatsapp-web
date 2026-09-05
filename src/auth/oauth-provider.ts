@@ -1,6 +1,7 @@
 import { Response } from 'express';
 import { createHash, randomBytes, randomUUID } from 'node:crypto';
 import fs from 'fs';
+import path from 'node:path';
 import { OAuthServerProvider, AuthorizationParams } from '@modelcontextprotocol/sdk/server/auth/provider.js';
 import { OAuthRegisteredClientsStore } from '@modelcontextprotocol/sdk/server/auth/clients.js';
 import {
@@ -14,7 +15,7 @@ import {
   OAuthTokens,
 } from '@modelcontextprotocol/sdk/shared/auth.js';
 import { AuthInfo } from '@modelcontextprotocol/sdk/server/auth/types.js';
-import { WhatsAppService } from '../services/whatsapp.js';
+import type { WhatsAppBackend } from '../services/backend.js';
 import { log } from '../utils/logger.js';
 
 const AUTH_CODE_TTL_MS = 60 * 1000; // Authorization codes are single-use and short-lived
@@ -62,7 +63,7 @@ export class WhatsAppOAuthProvider implements OAuthServerProvider {
   private codes = new Map<string, IssuedCode>();
 
   constructor(
-    private readonly whatsapp: WhatsAppService,
+    private readonly whatsapp: WhatsAppBackend,
     private readonly storePath: string,
   ) {
     this.load();
@@ -91,6 +92,7 @@ export class WhatsAppOAuthProvider implements OAuthServerProvider {
   private persist(): void {
     try {
       const state: PersistedState = { clients: this.clients, tokens: this.tokens };
+      fs.mkdirSync(path.dirname(this.storePath), { recursive: true, mode: 0o700 });
       fs.writeFileSync(this.storePath, JSON.stringify(state, null, 2));
     } catch (error) {
       log.error(`Could not write OAuth store at ${this.storePath}:`, error);
