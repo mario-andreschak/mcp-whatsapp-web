@@ -1,8 +1,9 @@
-import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
+import { registerTool } from './register.js';
+import { McpServer } from '@modelcontextprotocol/server';
 import { z } from 'zod';
 import type { WhatsAppBackend, SentMessage } from '../services/backend.js';
 import { log } from '../utils/logger.js';
-import type { CallToolResult, ImageContent, AudioContent, TextContent } from '@modelcontextprotocol/sdk/types.js';
+import type { CallToolResult, ImageContent, AudioContent, TextContent } from '@modelcontextprotocol/server';
 import { AudioUtils } from '../utils/audio.js';
 import fs from 'node:fs/promises';
 import path from 'node:path';
@@ -14,11 +15,11 @@ const failure = (message: string): CallToolResult => ({
 });
 
 export function registerMediaTools(server: McpServer, whatsappService: WhatsAppBackend): void {
-  server.tool(
+  registerTool(server,
     'send_media',
     'Send media (image, video, document, audio) via WhatsApp.',
     {
-      recipient_jid: z.string().describe('Recipient JID returned by a contact/chat tool; legacy @c.us phone JIDs are also accepted'),
+      recipient_jid: z.string().min(1).max(4096).describe('Recipient JID returned by a contact/chat tool; legacy @c.us phone JIDs are also accepted'),
       media_path: z.string().optional().describe('Absolute path to the local media file'),
       media_url: z.string().url().optional().describe('URL of the media file'),
       media_content: z.string().optional().describe('Base64 encoded media content'),
@@ -98,11 +99,11 @@ export function registerMediaTools(server: McpServer, whatsappService: WhatsAppB
     },
   );
 
-  server.tool(
+  registerTool(server,
     'download_media',
     'Download media from a WhatsApp message and return its content.',
     {
-      message_id: z.string().describe('Opaque message ID returned by a message tool'),
+      message_id: z.string().min(1).max(4096).describe('Opaque message ID returned by a message tool'),
       include_full_data: z.boolean().optional().default(false).describe('Include the full base64 data in the response'),
     },
     async ({ message_id, include_full_data }): Promise<CallToolResult> => {

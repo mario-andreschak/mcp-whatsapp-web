@@ -1,8 +1,8 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import type { Server as HttpServer } from 'node:http';
-import { Client } from '@modelcontextprotocol/sdk/client/index.js';
-import { StreamableHTTPClientTransport } from '@modelcontextprotocol/sdk/client/streamableHttp.js';
-import type { StreamableHTTPServerTransport } from '@modelcontextprotocol/sdk/server/streamableHttp.js';
+import { Client } from '@modelcontextprotocol/client';
+import { StreamableHTTPClientTransport } from '@modelcontextprotocol/client';
+import type { createMcpHandler } from '@modelcontextprotocol/server';
 import type { WhatsAppBackend } from '../src/services/backend.js';
 
 const mocks = vi.hoisted(() => ({
@@ -55,7 +55,7 @@ function deferred<T>() {
 function internals(server: WhatsAppMcpServer) {
   return server as unknown as {
     httpServer: HttpServer | null;
-    httpTransports: Record<string, StreamableHTTPServerTransport>;
+    httpHandler?: ReturnType<typeof createMcpHandler>;
   };
 }
 
@@ -71,6 +71,7 @@ beforeEach(() => {
   vi.stubEnv('MCP_HTTP_PORT', '0');
   vi.stubEnv('MCP_HTTP_HOST', '127.0.0.1');
   vi.stubEnv('MCP_OAUTH', 'false');
+  vi.stubEnv('MCP_OPERATOR_TOKEN', 'test-owner-token-with-32-characters-minimum');
 });
 
 afterEach(async () => {
@@ -116,10 +117,8 @@ describe('server lifecycle with selectable backends', () => {
 
     const client = new Client({ name: 'lifecycle-test', version: '1.0.0' });
     clients.push(client);
-    await client.connect(new StreamableHTTPClientTransport(new URL(`http://127.0.0.1:${address.port}/mcp`)));
-    const activeTransports = Object.values(internals(server).httpTransports);
-    expect(activeTransports).toHaveLength(1);
-    const closeSession = vi.spyOn(activeTransports[0], 'close');
+    await client.connect(new StreamableHTTPClientTransport(new URL(`http://127.0.0.1:${address.port}/mcp`), { requestInit: { headers: { Authorization: 'Bearer ' + process.env.MCP_OPERATOR_TOKEN } } }));
+    const closeSession = vi.spyOn(internals(server).httpHandler!, 'close');
     const closeListener = vi.spyOn(listener, 'close');
     const destroyError = new Error('Session persistence failed');
     backend.destroy.mockRejectedValue(destroyError);
@@ -127,7 +126,7 @@ describe('server lifecycle with selectable backends', () => {
     await expect(server.shutdown()).rejects.toBe(destroyError);
     expect(closeSession).toHaveBeenCalledOnce();
     expect(closeListener).toHaveBeenCalled();
-    expect(internals(server).httpTransports).toEqual({});
+    expect(internals(server).httpHandler).toBeUndefined();
     expect(internals(server).httpServer).toBeNull();
     expect(listener.listening).toBe(false);
     expect(mocks.browserManager).not.toHaveBeenCalled();

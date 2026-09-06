@@ -1,8 +1,9 @@
-import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
+import { registerTool } from './register.js';
+import { McpServer } from '@modelcontextprotocol/server';
 import { z } from 'zod';
 import type { WhatsAppBackend } from '../services/backend.js';
 import { log } from '../utils/logger.js';
-import { CallToolResult } from '@modelcontextprotocol/sdk/types.js';
+import { CallToolResult } from '@modelcontextprotocol/server';
 
 export function registerChatTools(
   server: McpServer,
@@ -10,11 +11,11 @@ export function registerChatTools(
 ): void {
   log.info('Registering chat tools...');
 
-  server.tool(
+  registerTool(server,
     'list_chats',
     'Get WhatsApp chats sorted by recent activity. Note: the "lastMessage" field is the newest event of ANY type (a call shows as type "call_log" with an empty body, media as "image"/"video", etc.) - NOT necessarily the last text message, and chat order reflects any activity, not just texts. To read actual conversation content, use list_messages.',
     {
-      limit: z.number().int().positive().optional().default(20).describe('Maximum number of chats to return'),
+      limit: z.number().int().positive().max(1000).optional().default(20).describe('Maximum number of chats to return'),
       // Note: whatsapp-web.js doesn't directly support query filtering or pagination for getChats()
       // We fetch all and filter/paginate locally, or implement more complex logic if needed.
       // For simplicity, we'll just use limit here.
@@ -39,11 +40,11 @@ export function registerChatTools(
     },
   );
 
-  server.tool(
+  registerTool(server,
     'get_chat_by_id',
     'Get WhatsApp chat metadata by JID.',
     {
-      jid: z.string().describe('The JID of the chat to retrieve (e.g., 123456789@c.us or 123456789-12345678@g.us)'),
+      jid: z.string().min(1).max(4096).describe('The JID of the chat to retrieve (e.g., 123456789@c.us or 123456789-12345678@g.us)'),
       // include_last_message: z.boolean().optional().default(true) // whatsapp-web.js getChatById includes last message info
     },
     async ({ jid }): Promise<CallToolResult> => {
@@ -73,11 +74,11 @@ export function registerChatTools(
   // through all chats or contacts, which can be inefficient with whatsapp-web.js.
   // Implementing simplified versions or indicating potential performance issues.
 
-  server.tool(
+  registerTool(server,
     'get_direct_chat_by_contact_number',
     'Get direct WhatsApp chat JID by contact phone number (less reliable, use get_chat_by_id if JID is known).',
     {
-      phone_number: z.string().describe('The phone number of the contact (e.g., 1234567890)'),
+      phone_number: z.string().min(1).max(4096).describe('The phone number of the contact (e.g., 1234567890)'),
     },
     async ({ phone_number }): Promise<CallToolResult> => {
       try {

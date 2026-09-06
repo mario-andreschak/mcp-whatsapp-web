@@ -1,8 +1,9 @@
-import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
+import { registerTool } from './register.js';
+import { McpServer } from '@modelcontextprotocol/server';
 import { z } from 'zod';
 import type { WhatsAppBackend } from '../services/backend.js'; // Removed unused SimpleMessage import
 import { log } from '../utils/logger.js';
-import { CallToolResult } from '@modelcontextprotocol/sdk/types.js';
+import { CallToolResult } from '@modelcontextprotocol/server';
 
 
 export function registerMessageTools(
@@ -11,12 +12,12 @@ export function registerMessageTools(
 ): void {
   log.info('Registering message tools...');
 
-  server.tool(
+  registerTool(server,
     'list_messages',
     'Get WhatsApp messages from a specific chat. This is the source of truth for actual message content: use it whenever the question is about what someone said/wrote. Entries include non-text events too (check the "type" field: "chat" = text message, "call_log" = call, "ptt" = voice note, "image"/"video" = media; non-text entries may have an empty "body").',
     {
-      chat_id: z.string().describe('The JID of the chat to retrieve messages from (e.g., 123456789@c.us or 123456789-12345678@g.us)'),
-      limit: z.number().int().positive().optional().default(50).describe('Maximum number of messages to return'),
+      chat_id: z.string().min(1).max(4096).describe('The JID of the chat to retrieve messages from (e.g., 123456789@c.us or 123456789-12345678@g.us)'),
+      limit: z.number().int().positive().max(1000).optional().default(50).describe('Maximum number of messages to return'),
       // Note: whatsapp-web.js fetchMessages doesn't support date/sender/query filtering directly.
       // Filtering would need to be done after fetching.
     },
@@ -37,11 +38,11 @@ export function registerMessageTools(
     },
   );
 
-  server.tool(
+  registerTool(server,
     'get_message_by_id',
     'Get a specific WhatsApp message by its ID.',
     {
-        message_id: z.string().describe('The opaque message ID returned by list_messages or send_message'),
+        message_id: z.string().min(1).max(4096).describe('The opaque message ID returned by list_messages or send_message'),
     },
     async ({ message_id }): Promise<CallToolResult> => {
         try {
@@ -68,12 +69,12 @@ export function registerMessageTools(
   // get_message_context is complex with whatsapp-web.js as it requires fetching messages around a specific one.
   // A simple implementation might fetch N messages before/after based on timestamp, but exact context is hard.
   // Let's implement a version that fetches recent messages and identifies the target.
-  server.tool(
+  registerTool(server,
     'get_message_context',
     'Get recent messages around a specific message ID within its chat (context accuracy depends on fetch limit).',
     {
-      message_id: z.string().describe('The serialized ID of the target message'),
-      limit: z.number().int().positive().optional().default(20).describe('Number of recent messages to fetch for context'),
+      message_id: z.string().min(1).max(4096).describe('The serialized ID of the target message'),
+      limit: z.number().int().positive().max(1000).optional().default(20).describe('Number of recent messages to fetch for context'),
     },
     async ({ message_id, limit }): Promise<CallToolResult> => {
       try {
@@ -115,11 +116,11 @@ export function registerMessageTools(
   );
 
   // get_last_interaction is similar to list_chats with limit 1
-  server.tool(
+  registerTool(server,
     'get_last_interaction',
     'Get the most recent event involving a specific contact or group JID. IMPORTANT: this returns the newest event of ANY type - including call logs, media, and system notifications, which have an empty "body" - NOT necessarily the last text message. To read what was actually said, use list_messages instead.',
     {
-      jid: z.string().describe('The JID of the contact or group (e.g., 123456789@c.us or 123456789-12345678@g.us)'),
+      jid: z.string().min(1).max(4096).describe('The JID of the contact or group (e.g., 123456789@c.us or 123456789-12345678@g.us)'),
     },
     async ({ jid }): Promise<CallToolResult> => {
       try {
@@ -144,12 +145,12 @@ export function registerMessageTools(
     },
   );
 
-  server.tool(
+  registerTool(server,
     'send_message',
     'Send a WhatsApp text message to a person or group.',
     {
-      recipient_jid: z.string().describe('The recipient JID (e.g., 123456789@c.us or 123456789-12345678@g.us)'),
-      message: z.string().describe('The message text to send'),
+      recipient_jid: z.string().min(1).max(4096).describe('The recipient JID (e.g., 123456789@c.us or 123456789-12345678@g.us)'),
+      message: z.string().min(1).max(65536).describe('The message text to send'),
     },
     async ({ recipient_jid, message }): Promise<CallToolResult> => {
       try {
