@@ -32,10 +32,13 @@ try {
   const bin = path.join(directory, 'node_modules', '.bin', process.platform === 'win32' ? 'mcp-whatsapp-web.cmd' : 'mcp-whatsapp-web');
   await readFile(bin);
   for (const backend of ['webjs', 'baileys']) for (const modern of [true, false]) await wireSmoke(entry, backend, modern);
-  const { BaileysStore } = await import(pathToFileURL(path.join(installed, 'dist', 'services', 'baileys-store.js')).href);
-  // Optional SQLite is a real installed native dependency, not just a mocked import.
-  const store = new BaileysStore(path.join(directory, 'native-sqlite'));
-  store.close();
+  // Windows retains loaded native DLLs until process exit, even after SQLite closes.
+  // Run the real installed addon in a child so cleanup can remove the tarball install.
+  execFileSync(process.execPath, ['--input-type=module', '-e',
+    `const { BaileysStore } = await import(process.argv[1]);
+     const store = new BaileysStore(process.argv[2]); store.close();`,
+    pathToFileURL(path.join(installed, 'dist', 'services', 'baileys-store.js')).href,
+    path.join(directory, 'native-sqlite')], { timeout: 30000, windowsHide: true, stdio: 'pipe' });
   const { AudioUtils } = await import(pathToFileURL(path.join(installed, 'dist', 'utils', 'audio.js')).href);
   const wav = Buffer.alloc(44 + 3200);
   wav.write('RIFF'); wav.writeUInt32LE(wav.length - 8, 4); wav.write('WAVE', 8); wav.write('fmt ', 12);
