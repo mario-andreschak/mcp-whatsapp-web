@@ -20,7 +20,7 @@ jobs:
       RUN_BROWSER_TESTS: 'true'
       # Ubuntu AppArmor disables unprivileged namespaces. This applies only to
       # Chromium fixture tests, never to the production WhatsApp browser.
-      MCP_TEST_NO_SANDBOX: ${{ runner.os == 'Linux' && 'true' || 'false' }}
+      MCP_TEST_NO_SANDBOX: ${{ matrix.os == 'ubuntu-latest' && 'true' || 'false' }}
       LOG_LEVEL: error
       LOG_STDERR_LEVEL: error
     steps:
