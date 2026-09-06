@@ -18,6 +18,9 @@ jobs:
     timeout-minutes: 25
     env:
       RUN_BROWSER_TESTS: 'true'
+      # Ubuntu AppArmor disables unprivileged namespaces. This applies only to
+      # Chromium fixture tests, never to the production WhatsApp browser.
+      MCP_TEST_NO_SANDBOX: ${{ runner.os == 'Linux' && 'true' || 'false' }}
       LOG_LEVEL: error
       LOG_STDERR_LEVEL: error
     steps:

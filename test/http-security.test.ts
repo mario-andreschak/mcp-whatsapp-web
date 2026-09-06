@@ -168,7 +168,7 @@ describe('real HTTP authorization boundary with an offline account fixture', () 
     const { default: puppeteer } = await import('puppeteer');
     const browser = await puppeteer.launch({ headless: true,
       executablePath: process.env.PUPPETEER_EXECUTABLE_PATH || undefined,
-      args: process.getuid?.() === 0 ? ['--no-sandbox'] : [] });
+      args: (process.getuid?.() === 0 || process.env.MCP_TEST_NO_SANDBOX === 'true') ? ['--no-sandbox'] : [] });
     try {
       const request = await begin('<script>untrusted client name</script>');
       const page = await browser.newPage();

@@ -11,14 +11,15 @@ const directory = await mkdtemp(path.join(tmpdir(), 'wa-package-'));
 const npmCli = process.env.npm_execpath;
 if (!npmCli) throw new Error('Run via npm run test:package.');
 function npm(args, cwd) {
-  return execFileSync(process.execPath, [npmCli, ...args], { cwd, encoding: 'utf8', timeout: 180000,
+  console.log('package gate: npm ' + args[0]);
+  return execFileSync(process.execPath, [npmCli, ...args], { cwd, encoding: 'utf8', timeout: 600000,
     env: { ...process.env, PUPPETEER_SKIP_DOWNLOAD: 'true' }, windowsHide: true, stdio: ['ignore', 'pipe', 'pipe'], maxBuffer: 8 * 1024 * 1024 });
 }
 try {
   const pack = JSON.parse(npm(['pack', '--json', '--ignore-scripts', '--pack-destination', directory], process.cwd()))[0];
   assert.ok(pack.bundled.includes('whatsapp-web.js'));
   await writeFile(path.join(directory, 'package.json'), JSON.stringify({ private: true, name: 'wa-installed-smoke', version: '1.0.0' }));
-  npm(['install', path.join(directory, pack.filename), '--omit=dev', '--no-fund', '--no-audit'], directory);
+  npm(['install', path.join(directory, pack.filename), '--omit=dev', '--no-fund', '--no-audit', '--foreground-scripts'], directory);
   const installed = path.join(directory, 'node_modules', 'mcp-whatsapp-web');
   const entry = path.join(installed, 'dist', 'index.js');
   const require = createRequire(entry);
@@ -48,7 +49,7 @@ try {
     const puppeteer = browserRequire('puppeteer');
     const browser = await puppeteer.launch({ headless: true,
       executablePath: process.env.PUPPETEER_EXECUTABLE_PATH || undefined,
-      args: process.getuid?.() === 0 ? ['--no-sandbox'] : [] });
+      args: (process.getuid?.() === 0 || process.env.MCP_TEST_NO_SANDBOX === 'true') ? ['--no-sandbox'] : [] });
     try {
       const page = await browser.newPage();
       await page.setContent('<p id="probe">Installed browser driver</p>');
