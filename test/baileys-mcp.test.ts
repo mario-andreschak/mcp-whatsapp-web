@@ -3,15 +3,16 @@ import { EventEmitter } from 'node:events';
 import { mkdtemp, rm } from 'node:fs/promises';
 import path from 'node:path';
 import os from 'node:os';
-import { Client } from '@modelcontextprotocol/sdk/client/index.js';
-import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
+import { Client } from '@modelcontextprotocol/client';
+import { McpServer } from '@modelcontextprotocol/server';
+// The v1 in-memory fixture transport checks backward compatibility; it is dev-only.
 import { InMemoryTransport } from '@modelcontextprotocol/sdk/inMemory.js';
 import { BaileysService, type BaileysSocket } from '../src/services/baileys.js';
 import { registerAuthTools } from '../src/tools/auth.js';
 import { registerChatTools } from '../src/tools/chats.js';
 import { registerContactTools } from '../src/tools/contacts.js';
 import { registerMessageTools } from '../src/tools/messages.js';
-import type { CallToolResult } from '@modelcontextprotocol/sdk/types.js';
+import type { CallToolResult } from '@modelcontextprotocol/server';
 
 const cleanups: Array<() => Promise<void>> = [];
 afterEach(async () => { for (const cleanup of cleanups.splice(0).reverse()) await cleanup(); });

@@ -1,113 +1,54 @@
-import ffmpeg from 'fluent-ffmpeg';
-import { createRequire } from 'module';
-import fs from 'fs';
-import path from 'path';
-import os from 'os';
+import { spawn } from 'node:child_process';
+import { createRequire } from 'node:module';
+import fs from 'node:fs';
+import path from 'node:path';
+import os from 'node:os';
 import { randomUUID } from 'node:crypto';
-import { log } from './logger.js';
 
-// ffmpeg-static is CommonJS (module.exports = <path string>), so load it via
-// require to get correct typings under NodeNext module resolution.
 const require = createRequire(import.meta.url);
-const ffmpegStatic = require('ffmpeg-static') as string | null;
-
-// Resolution order: FFMPEG_PATH env var (manual override) -> binary bundled
-// by ffmpeg-static (installed automatically with npm install) -> system PATH.
-const FFMPEG_PATH = process.env.FFMPEG_PATH || ffmpegStatic || null;
-if (FFMPEG_PATH) {
-  ffmpeg.setFfmpegPath(FFMPEG_PATH);
-  // Expose the resolved path so fluent-ffmpeg usages inside whatsapp-web.js
-  // (video/sticker conversion) pick up the same binary.
-  process.env.FFMPEG_PATH = FFMPEG_PATH;
-  log.info(`Using ffmpeg at: ${FFMPEG_PATH}`);
-} else {
-  log.warn('No ffmpeg binary found. Audio conversion will rely on ffmpeg being in the system PATH.');
-}
+const bundled = require('ffmpeg-static') as string | null;
+const executable = process.env.FFMPEG_PATH || (bundled && fs.existsSync(bundled) ? bundled : 'ffmpeg');
+// web.js uses this variable for its own video/sticker conversion too.
+if (executable !== 'ffmpeg') process.env.FFMPEG_PATH = executable;
 
 export class AudioUtils {
-  /**
-   * Convert an audio file to Opus format in an Ogg container using ffmpeg.
-   * Throws an error if ffmpeg is not found or conversion fails.
-   *
-   * @param inputPath Path to the input audio file.
-   * @param outputPath Optional path for the output file. Defaults to input path with .ogg extension.
-   * @param bitrate Target bitrate (e.g., "32k").
-   * @param sampleRate Target sample rate (e.g., 24000).
-   * @returns Path to the converted file.
-   */
-  static convertToOpusOgg(
-    inputPath: string,
-    outputPath?: string,
-    bitrate = '32k',
-    sampleRate = 24000,
-  ): Promise<string> {
-    return new Promise((resolve, reject) => {
-      if (!fs.existsSync(inputPath)) {
-        return reject(new Error(`Input file not found: ${inputPath}`));
-      }
-
-      const finalOutputPath = outputPath || `${path.parse(inputPath).name}.ogg`;
-      const outputDir = path.dirname(finalOutputPath);
-      if (!fs.existsSync(outputDir)) {
-        fs.mkdirSync(outputDir, { recursive: true });
-      }
-
-      log.debug(`Starting ffmpeg conversion: ${inputPath} -> ${finalOutputPath}`);
-      ffmpeg(inputPath)
-        .audioCodec('libopus')
-        .audioBitrate(bitrate)
-        .audioFrequency(sampleRate)
-        .audioChannels(1)
-        .outputOptions([
-          '-application voip', // Optimize for voice
-          '-vbr on', // Variable bitrate
-          '-compression_level 10', // Max compression
-          '-frame_duration 60', // Good frame duration for voice
-          '-avoid_negative_ts make_zero',
-        ])
-        .output(finalOutputPath)
-        .on('end', () => {
-          log.debug(`ffmpeg conversion finished: ${finalOutputPath}`);
-           resolve(finalOutputPath);
-         })
-         .on('error', (err: Error) => { // Add type Error
-           log.error(`ffmpeg conversion error for ${inputPath}:`, err);
-           reject(new Error(`ffmpeg conversion failed: ${err.message}`));
-         })
-        .run();
-    });
+  static async convertToOpusOgg(inputPath: string, outputPath?: string, bitrate = '32k', sampleRate = 24000): Promise<string> {
+    if (!fs.existsSync(inputPath)) throw new Error('Input file not found: ' + inputPath);
+    const stat = fs.statSync(inputPath);
+    if (!stat.isFile() || stat.size > 64 * 1024 * 1024) throw new Error('Audio input must be a regular file of at most 64 MiB.');
+    if (!/^[1-9][0-9]{0,2}k$/.test(bitrate) || ![8000, 12000, 16000, 24000, 48000].includes(sampleRate)) {
+      throw new Error('Invalid Opus bitrate or sample rate.');
+    }
+    const output = outputPath ?? path.join(path.dirname(inputPath), path.parse(inputPath).name + '.ogg');
+    fs.mkdirSync(path.dirname(output), { recursive: true });
+    const temporary = path.join(path.dirname(output), '.wa-audio-' + randomUUID() + '.ogg');
+    try {
+      await new Promise<void>((resolve, reject) => {
+        const child = spawn(executable, ['-hide_banner', '-loglevel', 'error', '-nostdin', '-n',
+          '-i', path.resolve(inputPath), '-vn', '-c:a', 'libopus', '-b:a', bitrate,
+          '-ar', String(sampleRate), '-ac', '1', '-application', 'voip', '-vbr', 'on',
+          '-compression_level', '10', '-frame_duration', '60', '-avoid_negative_ts', 'make_zero', temporary],
+          { windowsHide: true, stdio: ['ignore', 'ignore', 'pipe'] });
+        let errorText = '';
+        let timedOut = false;
+        child.stderr.on('data', chunk => { errorText = (errorText + chunk.toString()).slice(-4096); });
+        const timer = setTimeout(() => { timedOut = true; child.kill('SIGKILL'); }, 60_000);
+        child.once('error', error => { clearTimeout(timer); reject(error); });
+        child.once('close', code => {
+          clearTimeout(timer);
+          if (timedOut) reject(new Error('Audio conversion timed out after 60 seconds.'));
+          else if (code !== 0) reject(new Error('ffmpeg conversion failed: ' + errorText));
+          else resolve();
+        });
+      });
+      fs.renameSync(temporary, output);
+      return output;
+    } finally {
+      if (fs.existsSync(temporary)) fs.unlinkSync(temporary);
+    }
   }
 
-  /**
-   * Converts an audio file to Opus/Ogg and saves it to a temporary file.
-   * Useful when you need a temporary .ogg file for sending.
-   *
-   * @param inputPath Path to the input audio file.
-   * @param bitrate Target bitrate.
-   * @param sampleRate Target sample rate.
-   * @returns Path to the temporary converted file.
-   */
-  static async convertToOpusOggTemp(
-    inputPath: string,
-    bitrate = '32k',
-    sampleRate = 24000,
-  ): Promise<string> {
-    const tempFileName = `whatsapp_audio_converted_${randomUUID()}.ogg`;
-    const tempOutputPath = path.join(os.tmpdir(), tempFileName);
-    log.debug(`Converting ${inputPath} to temporary file: ${tempOutputPath}`);
-    try {
-        const convertedPath = await this.convertToOpusOgg(inputPath, tempOutputPath, bitrate, sampleRate);
-        return convertedPath;
-    } catch (error) {
-        // Clean up temp file if conversion failed partway
-        if (fs.existsSync(tempOutputPath)) {
-            try {
-                fs.unlinkSync(tempOutputPath);
-            } catch (cleanupError) {
-                log.warn(`Failed to clean up temporary file ${tempOutputPath}:`, cleanupError);
-            }
-        }
-        throw error; // Re-throw the original conversion error
-    }
+  static async convertToOpusOggTemp(inputPath: string, bitrate = '32k', sampleRate = 24000): Promise<string> {
+    return this.convertToOpusOgg(inputPath, path.join(os.tmpdir(), 'whatsapp_audio_converted_' + randomUUID() + '.ogg'), bitrate, sampleRate);
   }
 }

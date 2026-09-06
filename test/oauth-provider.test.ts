@@ -6,7 +6,10 @@ import os from 'node:os';
 import type { Response } from 'express';
 import { WhatsAppOAuthProvider } from '../src/auth/oauth-provider.js';
 import type { WhatsAppService } from '../src/services/whatsapp.js';
-import type { OAuthClientInformationFull } from '@modelcontextprotocol/sdk/shared/auth.js';
+import { OAuthClientInformationFullSchema } from '@modelcontextprotocol/core';
+import { z } from 'zod';
+type OAuthClientInformationFull = z.infer<typeof OAuthClientInformationFullSchema>;
+const BINDING = { issuer: 'http://localhost:3001/', resource: 'http://localhost:3001/mcp', accountNamespace: 'test' };
 
 const REDIRECT_URI = 'http://localhost:4200/api/oauth/callback';
 
@@ -33,13 +36,14 @@ async function authorize(client: OAuthClientInformationFull, codeChallenge: stri
   let redirectUrl = '';
   const res = { redirect: (_status: number, url: string) => { redirectUrl = url; } } as unknown as Response;
   await provider.authorize(client, { codeChallenge, redirectUri: REDIRECT_URI, state }, res);
-  return redirectUrl;
+  const txn = new URL(redirectUrl, BINDING.issuer).searchParams.get('txn')!;
+  return whatsappAuthenticated ? provider.completeTransaction(txn) : redirectUrl;
 }
 
 beforeEach(async () => {
   storePath = path.join(os.tmpdir(), `oauth-store-test-${Date.now()}-${Math.random().toString(36).slice(2)}.json`);
   whatsappAuthenticated = true;
-  provider = new WhatsAppOAuthProvider(fakeWhatsApp, storePath);
+  provider = new WhatsAppOAuthProvider(fakeWhatsApp, storePath, BINDING);
   await provider.clientsStore.registerClient!(makeClient());
 });
 
@@ -49,7 +53,7 @@ afterEach(() => {
 });
 
 describe('authorization', () => {
-  it('auto-approves with a code when WhatsApp is already linked', async () => {
+  it('issues a code only after explicit owner completion when WhatsApp is already linked', async () => {
     const { challenge } = pkcePair();
     const url = new URL(await authorize(makeClient(), challenge, 'my-state'));
     expect(url.origin + url.pathname).toBe(REDIRECT_URI);
@@ -147,7 +151,7 @@ describe('tokens', () => {
     const tokens = await issueToken();
     expect(fs.readFileSync(storePath, 'utf8')).not.toContain(tokens.access_token);
 
-    const provider2 = new WhatsAppOAuthProvider(fakeWhatsApp, storePath);
+    const provider2 = new WhatsAppOAuthProvider(fakeWhatsApp, storePath, BINDING);
     const info = await provider2.verifyAccessToken(tokens.access_token);
     expect(info.clientId).toBe('client-1');
   });
@@ -171,7 +175,7 @@ describe('tokens', () => {
 describe('store resilience', () => {
   it('starts empty when the store file is corrupt', () => {
     fs.writeFileSync(storePath, 'not json at all {');
-    const fresh = new WhatsAppOAuthProvider(fakeWhatsApp, storePath);
+    const fresh = new WhatsAppOAuthProvider(fakeWhatsApp, storePath, BINDING);
     expect(fresh.clientsStore.getClient('client-1')).toBeUndefined();
   });
 
@@ -185,7 +189,21 @@ describe('store resilience', () => {
         },
       },
     }));
-    const fresh = new WhatsAppOAuthProvider(fakeWhatsApp, storePath);
+    const fresh = new WhatsAppOAuthProvider(fakeWhatsApp, storePath, BINDING);
     await expect(fresh.verifyAccessToken(raw)).rejects.toThrow();
+  });
+});
+
+describe('account and issuer isolation', () => {
+  it('does not reuse grants from a different account namespace or issuer', async () => {
+    const client = makeClient();
+    const { verifier, challenge } = pkcePair();
+    const code = new URL(await authorize(client, challenge)).searchParams.get('code')!;
+    const token = (await provider.exchangeAuthorizationCode(client, code, verifier, REDIRECT_URI)).access_token;
+    for (const other of [{ ...BINDING, accountNamespace: 'another-account' }, { ...BINDING, issuer: 'https://other.example/' }]) {
+      const fresh = new WhatsAppOAuthProvider(fakeWhatsApp, storePath, other);
+      await expect(fresh.verifyAccessToken(token)).rejects.toThrow();
+    }
+    if (process.platform !== 'win32') expect(fs.statSync(storePath).mode & 0o777).toBe(0o600);
   });
 });

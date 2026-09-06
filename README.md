@@ -24,7 +24,7 @@ With this MCP server, you can:
 - **MCP Server**: Implements the [Model Context Protocol](https://modelcontextprotocol.io/) for seamless integration with AI assistants
 - **Media Support**: Send and receive images, videos, documents, and audio messages
 - **Multiple Transport Options**: Supports stdio and Streamable HTTP transports — even both at once from a single process (start with stdio and set `MCP_HTTP_PORT` to additionally expose `http://127.0.0.1:<port>/mcp`, or run HTTP-only with `--http`)
-- **Flexible Authentication**: QR code (as an MCP image tool), pairing code (`request_pairing_code` tool, or automatically printed to stderr at startup via `WHATSAPP_PAIRING_PHONE_NUMBER`), and an optional OAuth flow for HTTP clients (`MCP_OAUTH=true`) where the browser authorization page shows the WhatsApp QR code — unlinking WhatsApp revokes tokens so clients automatically re-authenticate
+- **Flexible Authentication**: QR code (as an MCP image tool), pairing code (`request_pairing_code` tool, or automatically printed to stderr at startup via `WHATSAPP_PAIRING_PHONE_NUMBER`), and owner-authenticated HTTP with optional OAuth (`MCP_OAUTH=true`) and explicit client consent — unlinking WhatsApp revokes tokens so clients automatically re-authenticate
 
 ## Architecture
 
@@ -36,9 +36,9 @@ This MCP server consists of:
 
 ## Prerequisites
 
-- Node.js >= 22.0.0 (Node 22 or 24 recommended for the Baileys SQLite dependency)
+- Node.js >= 22.19.0 (Node 22 or 24 recommended for the Baileys SQLite dependency)
 - npm or yarn
-- For the default `webjs` backend: Google Chrome or Microsoft Edge (auto-detected; needed for video/GIF codec support; other operations can use Puppeteer's bundled Chromium)
+- For the default `webjs` backend: Google Chrome or Microsoft Edge (auto-detected; needed for video/GIF codec support; other operations can use an explicitly installed compatible Chromium)
 - For `baileys`: install optional dependencies, including the native `better-sqlite3` module. No Chrome, Edge, or Chromium is needed at runtime.
 
 FFmpeg is bundled automatically via the `ffmpeg-static` npm package — no manual installation needed. You can point the `FFMPEG_PATH` environment variable at your own binary to override it.
@@ -132,6 +132,39 @@ npm start
 This will start the MCP server using stdio transport by default, which is suitable for integration with Claude Desktop or similar applications.
 
 > **Important:** After starting the server for the first time, you must authenticate with WhatsApp by using the `get_qr_code` tool and scanning the QR code with your phone. See the [Authentication](#authentication) section for detailed instructions.
+
+### HTTP authentication and owner consent
+
+Every HTTP listener requires `MCP_OPERATOR_TOKEN`, including loopback listeners and HTTP exposed alongside stdio. Generate a random URL-safe token, keep it in a private environment or secret store, and configure clients to send it as `Authorization: Bearer ...` when OAuth is disabled. Stdio does not require this token.
+
+```dotenv
+MCP_HTTP_PORT=3001
+MCP_HTTP_HOST=127.0.0.1
+# Required for HTTP: replace with 32–256 random URL-safe characters.
+MCP_OPERATOR_TOKEN=replace-with-a-random-generated-secret
+# Optional: issued OAuth grants replace the owner token on /mcp.
+MCP_OAUTH=true
+```
+
+With OAuth enabled, each client authorization opens an owner consent page. Enter the operator token there, review the client's name and callback URI, link WhatsApp if needed, and click **Authorize this client**. A linked account does not automatically approve a new client. The page keeps the operator token in memory; it is never put in a URL, cookie, or browser storage. QR/status/pairing/approval endpoints require owner authentication. OAuth clients use their issued token on `/mcp`; the operator token is reserved for approving them.
+
+This is one account per server process. Every explicitly approved client can read and send messages and unlink that account. Run separate processes with separate absolute session directories and separate owner tokens for independent accounts. HTTP uses stateless MCP request handling; it does not share MCP session IDs between clients.
+
+For a reverse proxy, configure `MCP_PUBLIC_URL=https://whatsapp.example.com` and preserve that public **Host** header upstream. Non-loopback binding requires an HTTPS public URL. Incoming Host, scheme and port must match the configured public address. Browser Origins must exactly match it or an entry in `MCP_ALLOWED_ORIGINS` (comma-separated absolute origins). Wildcard and opaque `null` Origins are rejected. Missing Origin is permitted for authenticated native clients. Do not derive the public URL from forwarded request headers.
+
+OAuth grants are bound to the canonical issuer/resource and the absolute account directory. Logout/session invalidation revokes tokens, pending approvals and codes. Codes expire after 60 seconds, approvals after 15 minutes, and access tokens after 30 days. State has bounded capacities of 256 clients, pending approvals, codes and tokens. Private OAuth files contain hashed access tokens and client registration credentials. Stop the server and remove its `oauth-store.json` to reset registrations/grants if needed; this does not remove the WhatsApp profile.
+
+**Upgrade:** unauthenticated HTTP is removed. Configure the operator token before restarting HTTP deployments. Old unbound OAuth grants are intentionally rejected: authorize clients again. web.js OAuth state now lives in `WHATSAPP_SESSION_DIR/oauth-store.json`; Baileys uses `BAILEYS_SESSION_DIR/oauth-store.json`. Existing WhatsApp profiles remain usable.
+
+### Protocol and runtime limits
+
+The server explicitly serves MCP revision **2026-07-28** through SDK 2, with legacy 2025 stdio/Streamable HTTP compatibility. It advertises implemented tools and their read/write annotations; it does not advertise unused logging or client roots capabilities. Tool schemas remain the source of truth for accepted inputs. Modern raw HTTP clients must send matching `Mcp-Protocol-Version`, `Mcp-Method`, and, for named calls, `Mcp-Name` headers.
+
+Tool calls time out after 60 seconds by default (`MCP_TOOL_TIMEOUT_MS`, 100–300000 ms), with at most 32 pending provider operations. Cancellation/timeout prevents the tool from starting its next backend operation. Providers cannot roll back a send already in flight: after an ambiguous failure, check the chat before retrying. Audio conversion uses a directly spawned FFmpeg process with a 60-second deadline and a 64 MiB local input limit.
+
+`node dist/index.js --no-connect` (or `MCP_AUTO_CONNECT=false`) exposes protocol discovery, ping and backend status without connecting to WhatsApp. This is intended for diagnostics and release tests. Normal startup still connects in the background. Closing stdio input shuts down the process and releases its driver.
+
+The npm tarball bundles web.js and its resolved Puppeteer 25 dependency tree, because npm ignores a dependency's `overrides` when installing it downstream. No browser binary is included. Use system Chrome/Edge (auto-detected) or `BROWSER_EXECUTABLE_PATH`; alternatively install the matching Puppeteer browser explicitly. Source checkouts install it during normal `npm ci` unless `PUPPETEER_SKIP_DOWNLOAD=true` is set. The release gate checks the actual installed Puppeteer version and Chromium launch.
 
 ### Development Mode
 
@@ -238,29 +271,9 @@ This is particularly useful when:
 
 ## Available MCP Tools
 
-### Authentication
-- `get_qr_code`- Get the QR code for WhatsApp Web authentication
-- `check_auth_status`- Check if you're currently authenticated with WhatsApp
-- `logout`- Log out from WhatsApp and clear the current session
+`check_auth_status`, `download_media`, `get_backend_status`, `get_chat_by_id`, `get_contact_by_id`, `get_direct_chat_by_contact_number`, `get_last_interaction`, `get_message_by_id`, `get_message_context`, `get_qr_code`, `list_chats`, `list_messages`, `logout`, `ping`, `request_pairing_code`, `search_contacts`, `send_media`, `send_message`.
 
-### Contacts
-- `search_contacts`- Search for contacts by name or phone number
-- `get_contact`- Get information about a specific contact
-
-### Chats
-- `list_chats`- List available chats with metadata
-- `get_chat`- Get information about a specific chat
-- `get_direct_chat_by_contact`- Find a direct chat with a specific contact
-
-### Messages
-- `list_messages`- Retrieve messages with optional filters
-- `get_message`- Get a specific message by ID
-- `send_message`- Send a text message to a chat
-
-### Media
-- `send_file`- Send a file (image, video, document) to a chat
-- `send_audio_message`- Send an audio message (voice note)
-- `download_media`- Download media from a message
+Use `tools/list` for input schemas. `send_media` supports files, URLs, base64 and voice-note conversion; `list_messages` returns the provider's message event types, not only text.
 
 ## Browser Process Management
 
@@ -308,7 +321,9 @@ This utility will:
 - `npm run cleanup-browsers`- Detect and clean up orphaned Chrome browser processes
 - `npm test` - Run the unit test suite (fast, no browser needed)
 - `npm run test:watch` - Run unit tests in watch mode during development
-- `npm run test:e2e` - Build, then run end-to-end tests (spawns the real server incl. a headless browser)
+- `npm run test:e2e` - Build and test actual compiled stdio/HTTP entry points with isolated state and no WhatsApp connection
+- `npm run test:package` - Install the production-only tarball, verify both protocol eras/backends, native SQLite/FFmpeg and installed browser dependencies
+- Set `RUN_BROWSER_TESTS=true` to include real Chromium owner-consent and installed browser-driver tests
 
 ## Troubleshooting
 
@@ -341,3 +356,9 @@ MIT
 ---
 
 This project is a TypeScript port of the original [whatsapp-mcp](https://github.com/lharries/whatsapp-mcp) by [lharries](https://github.com/lharries).
+
+## Verification scope
+
+CI runs Node 22/24 on Linux and Windows, plus Node 24 on macOS. It covers offline web.js/Baileys adapters, real SQLite persistence, real FFmpeg conversion, HTTP authorization, a real Chromium consent page, raw modern and legacy protocol exchanges, and the installed npm tarball. No live WhatsApp login, message send, or production host acceptance is automated. Offline fixtures cannot establish that WhatsApp will accept a real account or supply complete history; upstream service changes still require a separately authorized live acceptance check.
+
+Primary compatibility references: [SDK 2 protocol migration](https://ts.sdk.modelcontextprotocol.io/v2/migration/support-2026-07-28), [web.js guide](https://wwebjs.dev/guide/), [Baileys migration guidance](https://baileys.wiki/).
