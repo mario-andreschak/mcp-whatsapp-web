@@ -14,11 +14,11 @@ import util from 'util';
   console.log = console.info = console.debug = console.warn = console.error = toStderr;
 }
 
-import { WhatsAppMcpServer } from './server.js';
+const { WhatsAppMcpServer } = await import('./server.js');
 import { log } from './utils/logger.js';
 
 // Global reference to the server instance
-let serverInstance: WhatsAppMcpServer | null = null;
+let serverInstance: InstanceType<typeof WhatsAppMcpServer> | null = null;
 // Flag to track if shutdown is in progress to prevent multiple shutdown attempts
 let isShuttingDown = false;
 

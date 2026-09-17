@@ -1,9 +1,10 @@
+import { registerTool } from './register.js';
 import type { WhatsAppBackend } from '../services/backend.js';
 import qrcode from 'qrcode';
 import { z } from 'zod';
 import { log } from '../utils/logger.js';
-import { CallToolResult } from '@modelcontextprotocol/sdk/types.js';
-import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
+import { CallToolResult } from '@modelcontextprotocol/server';
+import { McpServer } from '@modelcontextprotocol/server';
 
 /**
  * Register authentication-related tools with the MCP server
@@ -16,7 +17,7 @@ export function registerAuthTools(
 ): void {
   log.info('Registering authentication tools...');
 
-  server.tool(
+  registerTool(server,
     'get_backend_status',
     'Report the selected WhatsApp backend, connection status, and available history. Baileys queries cover locally synchronized history; available does not imply a complete archive.',
     {},
@@ -25,7 +26,7 @@ export function registerAuthTools(
     }),
   );
 
-  server.tool(
+  registerTool(server,
     'get_qr_code',
     'Get the latest WhatsApp QR code as an image for authentication',
     {},
@@ -34,7 +35,7 @@ export function registerAuthTools(
     }
   );
 
-  server.tool(
+  registerTool(server,
     'request_pairing_code',
     'Request a pairing code as a text-based alternative to scanning the QR code. The user enters the returned 8-character code on their phone under Settings > Linked Devices > Link a device > "Link with phone number instead".',
     {
@@ -49,7 +50,7 @@ export function registerAuthTools(
     }
   );
 
-  server.tool(
+  registerTool(server,
     'check_auth_status',
     'Check if the WhatsApp client is authenticated and connected',
     {},
@@ -58,7 +59,7 @@ export function registerAuthTools(
     }
   );
 
-  server.tool(
+  registerTool(server,
     'logout',
     'Logout from WhatsApp and clear the current session',
     {},

@@ -1,282 +1,174 @@
-import { Response } from 'express';
+import type { Response } from 'express';
 import { createHash, randomBytes, randomUUID } from 'node:crypto';
-import fs from 'fs';
+import fs from 'node:fs';
 import path from 'node:path';
-import { OAuthServerProvider, AuthorizationParams } from '@modelcontextprotocol/sdk/server/auth/provider.js';
-import { OAuthRegisteredClientsStore } from '@modelcontextprotocol/sdk/server/auth/clients.js';
 import {
-  InvalidGrantError,
-  InvalidTokenError,
-  UnsupportedGrantTypeError,
-} from '@modelcontextprotocol/sdk/server/auth/errors.js';
-import {
-  OAuthClientInformationFull,
-  OAuthTokenRevocationRequest,
-  OAuthTokens,
-} from '@modelcontextprotocol/sdk/shared/auth.js';
-import { AuthInfo } from '@modelcontextprotocol/sdk/server/auth/types.js';
+  type OAuthServerProvider, type AuthorizationParams, type OAuthRegisteredClientsStore,
+  type AuthInfo, InvalidGrantError, InvalidTokenError, InvalidTargetError,
+  TooManyRequestsError, UnsupportedGrantTypeError,
+} from '@modelcontextprotocol/server-legacy/auth';
+import { OAuthClientInformationFullSchema, OAuthTokenRevocationRequestSchema, OAuthTokensSchema } from '@modelcontextprotocol/core';
+import { z } from 'zod';
+type OAuthClientInformationFull = z.infer<typeof OAuthClientInformationFullSchema>;
+type OAuthTokenRevocationRequest = z.infer<typeof OAuthTokenRevocationRequestSchema>;
+type OAuthTokens = z.infer<typeof OAuthTokensSchema>;
 import type { WhatsAppBackend } from '../services/backend.js';
 import { log } from '../utils/logger.js';
 
-const AUTH_CODE_TTL_MS = 60 * 1000; // Authorization codes are single-use and short-lived
-const TXN_TTL_MS = 15 * 60 * 1000; // Pending browser authorizations expire after 15 minutes
-const TOKEN_TTL_S = 30 * 24 * 60 * 60; // Access tokens live 30 days (revoked early on logout)
+const CODE_TTL = 60_000;
+const TXN_TTL = 15 * 60_000;
+const TOKEN_TTL = 30 * 24 * 60 * 60;
+const MAX_ENTRIES = 256;
+const hash = (value: string) => createHash('sha256').update(value).digest('hex');
+interface Binding { issuer: string; resource: string; accountNamespace: string }
+interface Pending { client: OAuthClientInformationFull; params: AuthorizationParams; createdAt: number }
+interface Code { clientId: string; codeChallenge: string; redirectUri: string; expiresAt: number }
+interface Token { clientId: string; expiresAt: number }
+interface State { binding: string; clients: Record<string, OAuthClientInformationFull>; tokens: Record<string, Token> }
 
-interface PendingTransaction {
-  client: OAuthClientInformationFull;
-  params: AuthorizationParams;
-  createdAt: number;
-}
-
-interface IssuedCode {
-  clientId: string;
-  codeChallenge: string;
-  redirectUri: string;
-  expiresAt: number;
-}
-
-interface StoredToken {
-  clientId: string;
-  issuedAt: number;
-  expiresAt: number; // seconds since epoch
-}
-
-interface PersistedState {
-  clients: Record<string, OAuthClientInformationFull>;
-  // Keyed by SHA-256 hash of the token, so the store file never contains usable secrets
-  tokens: Record<string, StoredToken>;
-}
-
-const sha256 = (value: string): string => createHash('sha256').update(value).digest('hex');
-
-/**
- * OAuth 2.1 authorization server whose "consent screen" is the WhatsApp QR /
- * pairing-code page: an authorization succeeds exactly when the WhatsApp
- * client reaches the authenticated state. Tokens gate the Streamable HTTP
- * /mcp endpoint and are revoked when the WhatsApp session is invalidated,
- * which makes standards-compliant MCP clients re-run the browser flow.
- */
+/** One account per process. Each client needs explicit authenticated owner consent. */
 export class WhatsAppOAuthProvider implements OAuthServerProvider {
-  private clients: Record<string, OAuthClientInformationFull> = {};
-  private tokens: Record<string, StoredToken> = {};
-  private pendingTxns = new Map<string, PendingTransaction>();
-  private codes = new Map<string, IssuedCode>();
+  private clients: Record<string, OAuthClientInformationFull> = Object.create(null);
+  private tokens: Record<string, Token> = Object.create(null);
+  private pendingTxns = new Map<string, Pending>();
+  private codes = new Map<string, Code>();
+  private readonly binding: string;
 
-  constructor(
-    private readonly whatsapp: WhatsAppBackend,
-    private readonly storePath: string,
-  ) {
+  constructor(private readonly whatsapp: WhatsAppBackend, private readonly storePath: string,
+    private readonly config: Binding) {
+    this.binding = hash(JSON.stringify(config));
     this.load();
   }
 
-  // --- persistence -----------------------------------------------------
-
   private load(): void {
     try {
-      if (fs.existsSync(this.storePath)) {
-        const data = JSON.parse(fs.readFileSync(this.storePath, 'utf8')) as PersistedState;
-        this.clients = data.clients ?? {};
-        this.tokens = data.tokens ?? {};
-        const now = Math.floor(Date.now() / 1000);
-        for (const [hash, token] of Object.entries(this.tokens)) {
-          if (token.expiresAt <= now) delete this.tokens[hash];
-        }
-      }
+      if (!fs.existsSync(this.storePath)) return;
+      const stat = fs.lstatSync(this.storePath);
+      if (!stat.isFile() || stat.size > 2 * 1024 * 1024) throw new Error('Invalid OAuth store file.');
+      const data = JSON.parse(fs.readFileSync(this.storePath, 'utf8')) as State;
+      // Old unbound tokens and files copied from another account/issuer fail closed.
+      if (data.binding !== this.binding) return;
+      this.clients = Object.assign(Object.create(null), data.clients ?? {});
+      this.tokens = Object.assign(Object.create(null), data.tokens ?? {});
+      this.sweepExpired();
     } catch (error) {
-      log.warn(`Could not read OAuth store at ${this.storePath}; starting empty.`, error);
-      this.clients = {};
-      this.tokens = {};
+      this.clients = Object.create(null); this.tokens = Object.create(null);
+      log.warn('Could not load OAuth store; starting without grants.', error);
     }
   }
 
   private persist(): void {
+    const state: State = { binding: this.binding, clients: this.clients, tokens: this.tokens };
+    fs.mkdirSync(path.dirname(this.storePath), { recursive: true, mode: 0o700 });
+    // Client credentials are secrets too. Replace atomically with a private file.
+    const temporary = this.storePath + '.' + randomUUID() + '.tmp';
     try {
-      const state: PersistedState = { clients: this.clients, tokens: this.tokens };
-      fs.mkdirSync(path.dirname(this.storePath), { recursive: true, mode: 0o700 });
-      fs.writeFileSync(this.storePath, JSON.stringify(state, null, 2));
-    } catch (error) {
-      log.error(`Could not write OAuth store at ${this.storePath}:`, error);
+      fs.writeFileSync(temporary, JSON.stringify(state), { mode: 0o600, flag: 'wx' });
+      fs.renameSync(temporary, this.storePath);
+    } finally {
+      if (fs.existsSync(temporary)) fs.unlinkSync(temporary);
     }
   }
 
-  // --- client registry (dynamic client registration) --------------------
-
   get clientsStore(): OAuthRegisteredClientsStore {
     return {
-      getClient: (clientId: string) => this.clients[clientId],
-      registerClient: (client: OAuthClientInformationFull) => {
-        this.clients[client.client_id] = client;
+      getClient: clientId => this.clients[clientId],
+      registerClient: client => {
+        if (Object.keys(this.clients).length >= MAX_ENTRIES) throw new TooManyRequestsError('Client registration capacity reached.');
+        // The SDK supplies generated fields. Generate them for direct callers too.
+        const fields = client as Partial<OAuthClientInformationFull>;
+        const full = { ...client, client_id: fields.client_id ?? randomUUID(),
+          client_id_issued_at: fields.client_id_issued_at ?? Math.floor(Date.now() / 1000) } as OAuthClientInformationFull;
+        this.clients[full.client_id] = full;
         this.persist();
-        log.info(`Registered OAuth client ${client.client_id} (${client.client_name ?? 'unnamed'})`);
-        return client;
+        return full;
       },
     };
   }
 
-  // --- authorization ----------------------------------------------------
-
-  async authorize(
-    client: OAuthClientInformationFull,
-    params: AuthorizationParams,
-    res: Response,
-  ): Promise<void> {
-    this.sweepExpired();
-
-    // WhatsApp session already linked: nothing for the user to do, approve directly.
-    if (this.whatsapp.isAuthenticated()) {
-      res.redirect(302, this.issueCodeRedirect(client, params));
-      return;
-    }
-
-    const txn = randomUUID();
-    this.pendingTxns.set(txn, { client, params, createdAt: Date.now() });
-    res.redirect(302, `/oauth/link?txn=${txn}`);
+  private validateResource(resource?: URL): void {
+    if (resource && resource.href !== this.config.resource) throw new InvalidTargetError('Unknown resource.');
   }
 
-  /** Look up a pending browser authorization. Used by the QR link page. */
-  getTransaction(txn: string): PendingTransaction | undefined {
+  async authorize(client: OAuthClientInformationFull, params: AuthorizationParams, res: Response): Promise<void> {
+    this.sweepExpired();
+    this.validateResource(params.resource);
+    if (this.pendingTxns.size >= MAX_ENTRIES) throw new TooManyRequestsError('Too many pending authorizations.');
+    const txn = randomUUID();
+    // Being linked is not consent: never issue a code on this request.
+    this.pendingTxns.set(txn, { client, params, createdAt: Date.now() });
+    res.redirect(302, '/oauth/link?txn=' + txn);
+  }
+
+  getTransaction(txn: string): Pending | undefined {
     this.sweepExpired();
     return this.pendingTxns.get(txn);
   }
 
-  /**
-   * Complete a pending authorization after WhatsApp reached the authenticated
-   * state. Consumes the transaction and returns the redirect URL (carrying the
-   * authorization code) to send the browser to.
-   */
+  /** Only the owner-authenticated POST /oauth/link/complete invokes this. */
   completeTransaction(txn: string): string {
     const pending = this.getTransaction(txn);
-    if (!pending) {
-      throw new Error('Unknown or expired authorization transaction.');
-    }
-    if (!this.whatsapp.isAuthenticated()) {
-      throw new Error('WhatsApp is not authenticated yet.');
-    }
+    if (!pending) throw new InvalidGrantError('Unknown or expired authorization transaction.');
+    if (!this.whatsapp.isAuthenticated()) throw new InvalidGrantError('WhatsApp is not authenticated yet.');
+    if (this.codes.size >= MAX_ENTRIES) throw new TooManyRequestsError('Authorization code capacity reached.');
     this.pendingTxns.delete(txn);
-    return this.issueCodeRedirect(pending.client, pending.params);
-  }
-
-  private issueCodeRedirect(client: OAuthClientInformationFull, params: AuthorizationParams): string {
     const code = randomBytes(32).toString('base64url');
-    this.codes.set(code, {
-      clientId: client.client_id,
-      codeChallenge: params.codeChallenge,
-      redirectUri: params.redirectUri,
-      expiresAt: Date.now() + AUTH_CODE_TTL_MS,
-    });
-    const redirect = new URL(params.redirectUri);
+    this.codes.set(code, { clientId: pending.client.client_id, codeChallenge: pending.params.codeChallenge,
+      redirectUri: pending.params.redirectUri, expiresAt: Date.now() + CODE_TTL });
+    const redirect = new URL(pending.params.redirectUri);
     redirect.searchParams.set('code', code);
-    if (params.state !== undefined) {
-      redirect.searchParams.set('state', params.state);
-    }
-    log.info(`Issued authorization code for client ${client.client_id}`);
-    return redirect.toString();
+    redirect.searchParams.set('iss', this.config.issuer);
+    if (pending.params.state !== undefined) redirect.searchParams.set('state', pending.params.state);
+    return redirect.href;
   }
 
-  // --- token endpoint ----------------------------------------------------
-
-  async challengeForAuthorizationCode(
-    client: OAuthClientInformationFull,
-    authorizationCode: string,
-  ): Promise<string> {
-    const entry = this.codes.get(authorizationCode);
-    if (!entry || entry.clientId !== client.client_id || entry.expiresAt < Date.now()) {
-      throw new InvalidGrantError('Invalid or expired authorization code.');
-    }
+  async challengeForAuthorizationCode(client: OAuthClientInformationFull, code: string): Promise<string> {
+    const entry = this.codes.get(code);
+    if (!entry || entry.clientId !== client.client_id || entry.expiresAt <= Date.now()) throw new InvalidGrantError('Invalid or expired authorization code.');
     return entry.codeChallenge;
   }
 
-  async exchangeAuthorizationCode(
-    client: OAuthClientInformationFull,
-    authorizationCode: string,
-    _codeVerifier?: string, // PKCE is validated by the SDK token handler
-    redirectUri?: string,
-  ): Promise<OAuthTokens> {
-    const entry = this.codes.get(authorizationCode);
-    if (!entry || entry.clientId !== client.client_id || entry.expiresAt < Date.now()) {
-      throw new InvalidGrantError('Invalid or expired authorization code.');
-    }
-    if (redirectUri && redirectUri !== entry.redirectUri) {
-      throw new InvalidGrantError('redirect_uri does not match the authorization request.');
-    }
-    this.codes.delete(authorizationCode); // single-use
-
-    const accessToken = randomBytes(32).toString('base64url');
-    const now = Math.floor(Date.now() / 1000);
-    this.tokens[sha256(accessToken)] = {
-      clientId: client.client_id,
-      issuedAt: now,
-      expiresAt: now + TOKEN_TTL_S,
-    };
+  async exchangeAuthorizationCode(client: OAuthClientInformationFull, code: string, _verifier?: string,
+    redirectUri?: string, resource?: URL): Promise<OAuthTokens> {
+    this.validateResource(resource);
+    await this.challengeForAuthorizationCode(client, code);
+    const entry = this.codes.get(code)!;
+    if (redirectUri !== entry.redirectUri) throw new InvalidGrantError('redirect_uri does not match the authorization request.');
+    this.sweepExpired();
+    if (Object.keys(this.tokens).length >= MAX_ENTRIES) throw new TooManyRequestsError('Token capacity reached.');
+    this.codes.delete(code); // SDK validates S256 PKCE before calling this method.
+    const token = randomBytes(32).toString('base64url');
+    this.tokens[hash(token)] = { clientId: client.client_id, expiresAt: Math.floor(Date.now() / 1000) + TOKEN_TTL };
     this.persist();
-    log.info(`Issued access token for client ${client.client_id}`);
-
-    return {
-      access_token: accessToken,
-      token_type: 'bearer',
-      expires_in: TOKEN_TTL_S,
-    };
+    return { access_token: token, token_type: 'bearer', expires_in: TOKEN_TTL };
   }
 
   async exchangeRefreshToken(): Promise<OAuthTokens> {
-    throw new UnsupportedGrantTypeError(
-      'Refresh tokens are not supported; re-run the authorization flow.',
-    );
+    throw new UnsupportedGrantTypeError('Refresh tokens are not supported; re-run the authorization flow.');
   }
-
-  // --- verification / revocation -----------------------------------------
 
   async verifyAccessToken(token: string): Promise<AuthInfo> {
-    const hash = sha256(token);
-    const entry = this.tokens[hash];
-    const now = Math.floor(Date.now() / 1000);
-    if (!entry || entry.expiresAt <= now) {
-      if (entry) {
-        delete this.tokens[hash];
-        this.persist();
-      }
-      throw new InvalidTokenError('Invalid or expired access token.');
-    }
-    return {
-      token,
-      clientId: entry.clientId,
-      scopes: [],
-      expiresAt: entry.expiresAt,
-    };
+    const entry = this.tokens[hash(token)];
+    if (!entry || entry.expiresAt <= Math.floor(Date.now() / 1000)) throw new InvalidTokenError('Invalid or expired access token.');
+    return { token, clientId: entry.clientId, scopes: [], expiresAt: entry.expiresAt, resource: new URL(this.config.resource) };
   }
 
-  async revokeToken(
-    client: OAuthClientInformationFull,
-    request: OAuthTokenRevocationRequest,
-  ): Promise<void> {
-    const hash = sha256(request.token);
-    const entry = this.tokens[hash];
-    if (entry && entry.clientId === client.client_id) {
-      delete this.tokens[hash];
-      this.persist();
-      log.info(`Revoked access token for client ${client.client_id}`);
+  async revokeToken(client: OAuthClientInformationFull, request: OAuthTokenRevocationRequest): Promise<void> {
+    if (this.tokens[hash(request.token)]?.clientId === client.client_id) {
+      delete this.tokens[hash(request.token)]; this.persist();
     }
   }
 
-  /**
-   * Drop every issued token, e.g. after the WhatsApp session was unlinked.
-   * Clients then receive 401 on their next request and re-run the flow.
-   */
   revokeAllTokens(): void {
-    const count = Object.keys(this.tokens).length;
-    if (count === 0) return;
-    this.tokens = {};
+    this.tokens = Object.create(null);
+    this.codes.clear(); this.pendingTxns.clear();
     this.persist();
-    log.warn(`WhatsApp session invalidated: revoked ${count} OAuth access token(s).`);
   }
 
   private sweepExpired(): void {
     const now = Date.now();
-    for (const [txn, pending] of this.pendingTxns) {
-      if (pending.createdAt + TXN_TTL_MS < now) this.pendingTxns.delete(txn);
-    }
-    for (const [code, entry] of this.codes) {
-      if (entry.expiresAt < now) this.codes.delete(code);
-    }
+    for (const [txn, entry] of this.pendingTxns) if (entry.createdAt + TXN_TTL <= now) this.pendingTxns.delete(txn);
+    for (const [code, entry] of this.codes) if (entry.expiresAt <= now) this.codes.delete(code);
+    for (const [key, entry] of Object.entries(this.tokens)) if (entry.expiresAt <= now / 1000) delete this.tokens[key];
   }
 }

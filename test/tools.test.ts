@@ -1,6 +1,7 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
-import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
-import { Client } from '@modelcontextprotocol/sdk/client/index.js';
+import { McpServer } from '@modelcontextprotocol/server';
+import { Client } from '@modelcontextprotocol/client';
+// The v1 in-memory fixture transport checks backward compatibility; it is dev-only.
 import { InMemoryTransport } from '@modelcontextprotocol/sdk/inMemory.js';
 import { registerAuthTools } from '../src/tools/auth.js';
 import { registerChatTools } from '../src/tools/chats.js';
@@ -254,5 +255,17 @@ describe('backend-neutral media tools', () => {
     } finally {
       await fs.rm(directory, { recursive: true, force: true });
     }
+  });
+});
+
+describe('bounded input compatibility', () => {
+  it('keeps an empty contact search valid while rejecting oversized query and list limits', async () => {
+    const result = await client.callTool({ name: 'search_contacts', arguments: { query: '' } });
+    expect(result.isError).not.toBe(true);
+    expect(fakeService.searchContacts).toHaveBeenCalledWith('');
+    const oversized = await client.callTool({ name: 'search_contacts', arguments: { query: 'x'.repeat(4097) } });
+    expect(oversized.isError).toBe(true);
+    const tooMany = await client.callTool({ name: 'list_messages', arguments: { chat_id: 'fixture-chat', limit: 1001 } });
+    expect(tooMany.isError).toBe(true);
   });
 });

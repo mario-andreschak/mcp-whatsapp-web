@@ -12,7 +12,9 @@
     {
       "src": "https://raw.githubusercontent.com/mario-andreschak/mcp-whatsapp-web/main/public/logo.png",
       "mimeType": "image/png",
-      "sizes": ["391x389"]
+      "sizes": [
+        "391x389"
+      ]
     }
   ],
   "version": "1.2.0",
@@ -33,7 +35,10 @@
           "isRequired": false,
           "format": "string",
           "default": "webjs",
-          "choices": ["webjs", "baileys"]
+          "choices": [
+            "webjs",
+            "baileys"
+          ]
         },
         {
           "name": "BAILEYS_SESSION_DIR",
@@ -47,7 +52,14 @@
           "isRequired": false,
           "format": "string",
           "default": "info",
-          "choices": ["trace", "debug", "info", "warn", "error", "fatal"]
+          "choices": [
+            "trace",
+            "debug",
+            "info",
+            "warn",
+            "error",
+            "fatal"
+          ]
         },
         {
           "name": "LOG_STDERR_LEVEL",
@@ -55,7 +67,14 @@
           "isRequired": false,
           "format": "string",
           "default": "warn",
-          "choices": ["trace", "debug", "info", "warn", "error", "fatal"]
+          "choices": [
+            "trace",
+            "debug",
+            "info",
+            "warn",
+            "error",
+            "fatal"
+          ]
         },
         {
           "name": "WHATSAPP_HEADLESS",
@@ -129,9 +148,42 @@
         },
         {
           "name": "MCP_OAUTH",
-          "description": "Enable OAuth for the HTTP endpoint: /mcp requires a bearer token and clients authenticate via a browser page showing the WhatsApp QR code / pairing form",
+          "description": "Use issued OAuth tokens on /mcp; every client requires explicit owner-authenticated consent.",
           "isRequired": false,
           "format": "boolean"
+        },
+        {
+          "name": "MCP_OPERATOR_TOKEN",
+          "description": "Required for every HTTP listener; 32\u2013256 random URL-safe characters. Stdio does not require it.",
+          "isRequired": false,
+          "isSecret": true,
+          "format": "string"
+        },
+        {
+          "name": "MCP_PUBLIC_URL",
+          "description": "Canonical HTTPS public origin for non-loopback HTTP or a reverse proxy. Preserve this Host upstream.",
+          "isRequired": false,
+          "format": "string"
+        },
+        {
+          "name": "MCP_ALLOWED_ORIGINS",
+          "description": "Comma-separated additional exact browser origins for HTTP. No wildcard or null origins.",
+          "isRequired": false,
+          "format": "string"
+        },
+        {
+          "name": "MCP_AUTO_CONNECT",
+          "description": "Set false for diagnostics that expose MCP without connecting to WhatsApp.",
+          "isRequired": false,
+          "format": "boolean",
+          "default": "true"
+        },
+        {
+          "name": "MCP_TOOL_TIMEOUT_MS",
+          "description": "Tool deadline in milliseconds, 100\u2013300000; sends already in flight may still complete.",
+          "isRequired": false,
+          "format": "number",
+          "default": "60000"
         }
       ]
     }

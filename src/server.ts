@@ -1,14 +1,10 @@
-import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
-import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js';
-import { StreamableHTTPServerTransport } from '@modelcontextprotocol/sdk/server/streamableHttp.js';
-import { Implementation, isInitializeRequest } from '@modelcontextprotocol/sdk/types.js';
-import {
-  mcpAuthRouter,
-  getOAuthProtectedResourceMetadataUrl,
-} from '@modelcontextprotocol/sdk/server/auth/router.js';
-import { requireBearerAuth } from '@modelcontextprotocol/sdk/server/auth/middleware/bearerAuth.js';
-import { randomUUID } from 'node:crypto';
-import express, { Request, Response, RequestHandler } from 'express';
+import { guardedBackend } from './tools/register.js';
+import { McpServer, createMcpHandler, type Implementation } from '@modelcontextprotocol/server';
+import { serveStdio } from '@modelcontextprotocol/server/stdio';
+import { toNodeHandler } from '@modelcontextprotocol/node';
+import { mcpAuthRouter, getOAuthProtectedResourceMetadataUrl, requireBearerAuth } from '@modelcontextprotocol/server-legacy/auth';
+import { operatorGuard, publicOrigin, httpBoundary } from './auth/http-security.js';
+import express, { type RequestHandler } from 'express';
 import path from 'path';
 import { WhatsAppOAuthProvider } from './auth/oauth-provider.js';
 import { createLinkRouter } from './auth/link-page.js';
@@ -33,9 +29,8 @@ export type TransportType = 'stdio' | 'http';
 export class WhatsAppMcpServer {
   private whatsapp!: WhatsAppBackend;
   private browserProcessManager?: BrowserProcessManager;
-  // One transport (each with its own McpServer facade) per Streamable HTTP session.
-  // They all share the single WhatsAppService instance and thus the same WhatsApp session.
-  private httpTransports: { [sessionId: string]: StreamableHTTPServerTransport } = {};
+  private stdio?: Awaited<ReturnType<typeof serveStdio>>;
+  private httpHandler?: ReturnType<typeof createMcpHandler>;
   private httpServer: ReturnType<express.Express['listen']> | null = null;
   private stopping = false;
   private shutdownPromise?: Promise<void>;
@@ -51,19 +46,17 @@ export class WhatsAppMcpServer {
    */
   private createServer(): McpServer {
     const server = new McpServer(SERVER_INFO, {
-      capabilities: {
-        logging: {},
-      },
       instructions: 'This server provides tools to interact with WhatsApp.',
     });
 
-    registerAuthTools(server, this.whatsapp);
-    registerContactTools(server, this.whatsapp);
-    registerChatTools(server, this.whatsapp);
-    registerMessageTools(server, this.whatsapp);
-    registerMediaTools(server, this.whatsapp);
+    const backend = guardedBackend(this.whatsapp);
+    registerAuthTools(server, backend);
+    registerContactTools(server, backend);
+    registerChatTools(server, backend);
+    registerMessageTools(server, backend);
+    registerMediaTools(server, backend);
 
-    server.tool('ping', async () => ({
+    server.registerTool('ping', { description: 'Check server availability without contacting WhatsApp.', annotations: { readOnlyHint: true, idempotentHint: true, openWorldHint: false } }, async () => ({
       content: [{ type: 'text', text: 'pong' }],
     }));
 
@@ -102,6 +95,8 @@ export class WhatsAppMcpServer {
       return;
     }
 
+    if (process.env.MCP_AUTO_CONNECT === 'false' || process.argv.includes('--no-connect')) return;
+
     log.info('Initializing WhatsApp client in the background...');
     void (async () => {
       try {
@@ -125,12 +120,7 @@ export class WhatsAppMcpServer {
 
   private async startStdioTransport() {
     log.info('Starting MCP server with stdio transport...');
-    const stdioTransport = new StdioServerTransport();
-    stdioTransport.onerror = (error) => {
-      log.error('StdioTransport Error:', error);
-    };
-    const server = this.createServer();
-    await server.connect(stdioTransport);
+    this.stdio = await serveStdio(() => this.createServer(), { legacy: 'serve', onerror: error => log.error('Stdio transport error:', error) });
     // When the MCP client disconnects (stdin closed), nothing can ever reach
     // this process over stdio again - shut down cleanly so the browser is
     // released and no zombie process keeps the WhatsApp session dir locked.
@@ -146,130 +136,47 @@ export class WhatsAppMcpServer {
     log.info('MCP server connected via stdio.');
   }
 
-  /**
-   * Streamable HTTP transport (MCP spec 2025-03-26). Clients POST JSON-RPC to
-   * /mcp; the first initialize request opens a session identified by the
-   * mcp-session-id header. GET /mcp opens the optional server-to-client SSE
-   * stream, DELETE /mcp terminates the session.
-   */
+  /** Each authenticated HTTP request has an isolated MCP facade over this account. */
   private async startHttpTransport(port: number) {
-    log.info(`Starting MCP server with Streamable HTTP transport on port ${port}...`);
-    const app = express();
-    app.use(express.json({ limit: '10mb' }));
-
-    // Bind to localhost only by default: the endpoint exposes a personal
-    // WhatsApp session. Enable MCP_OAUTH=true to require OAuth bearer tokens.
+    if (!Number.isInteger(port) || port < 0 || port > 65535) throw new Error('Invalid MCP_HTTP_PORT.');
+    const ownerGuard = operatorGuard();
     const host = process.env.MCP_HTTP_HOST || '127.0.0.1';
-
-    // Optional OAuth layer: the server acts as its own authorization server,
-    // and the "consent screen" is the WhatsApp QR / pairing-code page.
+    // Validate remote configuration before opening the listener (port 0 is useful for tests).
+    publicOrigin(host, port);
+    const app = express();
+    app.disable('x-powered-by');
+    await new Promise<void>((resolve, reject) => {
+      this.httpServer = app.listen(port, host, () => resolve());
+      this.httpServer.once('error', reject);
+    });
+    const address = this.httpServer!.address();
+    if (!address || typeof address === 'string') throw new Error('HTTP listener has no TCP address.');
+    const issuerUrl = new URL(publicOrigin(host, address.port));
+    const mcpUrl = new URL('/mcp', issuerUrl);
+    app.use(httpBoundary(issuerUrl.origin));
+    app.use(express.json({ limit: '10mb' }));
+    app.get('/health', (_req, res) => { res.json({ status: 'ok' }); });
     const guards: RequestHandler[] = [];
     if (process.env.MCP_OAUTH === 'true') {
-      const issuerUrl = new URL(`http://${host === '0.0.0.0' ? '127.0.0.1' : host}:${port}`);
-      const mcpUrl = new URL('/mcp', issuerUrl);
-      const provider = new WhatsAppOAuthProvider(
-        this.whatsapp,
-        this.whatsapp.backend === 'baileys'
-          ? path.resolve(process.env.BAILEYS_SESSION_DIR || path.join(process.cwd(), 'baileys-sessions'), 'oauth-store.json')
-          : path.join(process.cwd(), '.oauth-store.json'),
-      );
-      // Unlinking WhatsApp (logout / auth failure) revokes all tokens, so
-      // clients get a 401 and automatically re-run the browser flow.
+      const sessionDir = path.resolve(this.whatsapp.backend === 'baileys'
+        ? process.env.BAILEYS_SESSION_DIR || 'baileys-sessions'
+        : process.env.WHATSAPP_SESSION_DIR || 'whatsapp-sessions');
+      const provider = new WhatsAppOAuthProvider(this.whatsapp,
+        path.join(sessionDir, 'oauth-store.json'),
+        { issuer: issuerUrl.href, resource: mcpUrl.href, accountNamespace: sessionDir });
       this.whatsapp.onSessionInvalidated(() => provider.revokeAllTokens());
-
-      app.use(
-        mcpAuthRouter({
-          provider,
-          issuerUrl,
-          resourceServerUrl: mcpUrl,
-          resourceName: 'WhatsApp MCP Server',
-        }),
-      );
-      app.use('/oauth/link', createLinkRouter(provider, this.whatsapp));
-      guards.push(
-        requireBearerAuth({
-          verifier: provider,
-          resourceMetadataUrl: getOAuthProtectedResourceMetadataUrl(mcpUrl),
-        }),
-      );
-      log.info('OAuth authorization enabled: /mcp requires a bearer token.');
+      app.use(mcpAuthRouter({ provider, issuerUrl, resourceServerUrl: mcpUrl, resourceName: 'WhatsApp MCP Server' }));
+      app.use('/oauth/link', createLinkRouter(provider, this.whatsapp, ownerGuard));
+      guards.push(requireBearerAuth({ verifier: provider, resourceMetadataUrl: getOAuthProtectedResourceMetadataUrl(mcpUrl) }));
+    } else {
+      guards.push(ownerGuard);
     }
-
-    app.post('/mcp', ...guards, async (req: Request, res: Response) => {
-      const sessionId = req.headers['mcp-session-id'] as string | undefined;
-
-      try {
-        let transport: StreamableHTTPServerTransport;
-
-        if (sessionId && this.httpTransports[sessionId]) {
-          transport = this.httpTransports[sessionId];
-        } else if (!sessionId && isInitializeRequest(req.body)) {
-          transport = new StreamableHTTPServerTransport({
-            sessionIdGenerator: () => randomUUID(),
-            onsessioninitialized: (sid: string) => {
-              log.info(`Streamable HTTP session initialized: ${sid}`);
-              this.httpTransports[sid] = transport;
-            },
-          });
-          transport.onclose = () => {
-            if (transport.sessionId && this.httpTransports[transport.sessionId]) {
-              log.info(`Streamable HTTP session closed: ${transport.sessionId}`);
-              delete this.httpTransports[transport.sessionId];
-            }
-          };
-          await this.createServer().connect(transport);
-        } else {
-          res.status(400).json({
-            jsonrpc: '2.0',
-            error: { code: -32000, message: 'Bad Request: no valid session ID provided' },
-            id: null,
-          });
-          return;
-        }
-
-        await transport.handleRequest(req, res, req.body);
-      } catch (error) {
-        log.error('Error handling MCP HTTP request:', error);
-        if (!res.headersSent) {
-          res.status(500).json({
-            jsonrpc: '2.0',
-            error: { code: -32603, message: 'Internal server error' },
-            id: null,
-          });
-        }
-      }
+    this.httpHandler = createMcpHandler(() => this.createServer(), {
+      legacy: 'stateless', onerror: error => log.error('HTTP transport error:', error),
     });
-
-    // GET (SSE notification stream) and DELETE (session termination) share the same lookup
-    const handleSessionRequest = async (req: Request, res: Response) => {
-      const sessionId = req.headers['mcp-session-id'] as string | undefined;
-      const transport = sessionId ? this.httpTransports[sessionId] : undefined;
-      if (!transport) {
-        res.status(400).send('Invalid or missing mcp-session-id header');
-        return;
-      }
-      try {
-        await transport.handleRequest(req, res);
-      } catch (error) {
-        log.error(`Error handling ${req.method} /mcp for session ${sessionId}:`, error);
-        if (!res.headersSent) {
-          res.status(500).send('Internal server error');
-        }
-      }
-    };
-    app.get('/mcp', ...guards, handleSessionRequest);
-    app.delete('/mcp', ...guards, handleSessionRequest);
-
-    return new Promise<void>((resolve, reject) => {
-      this.httpServer = app.listen(port, host, () => {
-        log.info(`Streamable HTTP endpoint listening on http://${host}:${port}/mcp`);
-        resolve();
-      });
-      this.httpServer.on('error', (error: Error) => {
-        log.error('HTTP server failed to start:', error);
-        reject(error);
-      });
-    });
+    const handle = toNodeHandler(this.httpHandler);
+    app.all('/mcp', ...guards, async (req, res) => { await handle(req, res, req.body); });
+    log.info('Authenticated HTTP endpoint listening at ' + mcpUrl.href);
   }
 
   /**
@@ -302,14 +209,10 @@ export class WhatsAppMcpServer {
   }
 
   private async closeTransports(): Promise<void> {
-    for (const sessionId of Object.keys(this.httpTransports)) {
-      try {
-        await this.httpTransports[sessionId]?.close();
-      } catch (error) {
-        log.warn(`Error closing HTTP session ${sessionId}:`, error);
-      }
-      delete this.httpTransports[sessionId];
-    }
+    await this.stdio?.close();
+    this.stdio = undefined;
+    await this.httpHandler?.close();
+    this.httpHandler = undefined;
     const httpServer = this.httpServer;
     this.httpServer = null;
     if (httpServer) {

@@ -1,8 +1,9 @@
-import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
+import { registerTool } from './register.js';
+import { McpServer } from '@modelcontextprotocol/server';
 import { z } from 'zod';
 import type { WhatsAppBackend } from '../services/backend.js';
 import { log } from '../utils/logger.js';
-import { CallToolResult } from '@modelcontextprotocol/sdk/types.js';
+import { CallToolResult } from '@modelcontextprotocol/server';
 
 export function registerContactTools(
   server: McpServer,
@@ -10,11 +11,11 @@ export function registerContactTools(
 ): void {
   log.info('Registering contact tools...');
 
-  server.tool(
+  registerTool(server,
     'search_contacts',
     'Search WhatsApp contacts by name or phone number.',
     {
-      query: z.string().describe('Search term to match against contact names or phone numbers'),
+      query: z.string().max(4096).describe('Search term to match against contact names or phone numbers'),
     },
     async ({ query }): Promise<CallToolResult> => {
       try {
@@ -40,11 +41,11 @@ export function registerContactTools(
     },
   );
 
-  server.tool(
+  registerTool(server,
     'get_contact_by_id',
     'Get contact details by JID.',
      {
-      jid: z.string().describe('The JID of the contact to retrieve (e.g., 123456789@c.us)'),
+      jid: z.string().min(1).max(4096).describe('The JID of the contact to retrieve (e.g., 123456789@c.us)'),
     },
     async ({ jid }): Promise<CallToolResult> => {
         try {
