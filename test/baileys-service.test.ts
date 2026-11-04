@@ -394,3 +394,39 @@ describe('Baileys sending and media', () => {
     expect(stream.destroyed).toBe(true);
   });
 });
+
+describe('BaileysService inbound messages', () => {
+  it('reports live messages with their mentions, and never history', async () => {
+    const { service, sockets } = await connected();
+    const seen: Array<{ body: string; mentionedIds?: string[]; quotedMessageId?: string }> = [];
+    service.onMessage(message => seen.push(message));
+    sockets[0].ev.emit('messages.upsert', { type: 'append', messages: [oldMessage({ id: 'old' }, 'history')] });
+    sockets[0].ev.emit('messages.upsert', { type: 'notify', messages: [{
+      key: { id: 'live', remoteJid: group, participant: peer, fromMe: false },
+      message: { extendedTextMessage: { text: '@bot hello', contextInfo: { mentionedJid: [user], stanzaId: 'quoted-id' } } },
+      messageTimestamp: 1700000001,
+    }] });
+    await vi.waitFor(() => expect(seen).toHaveLength(1));
+    expect(seen[0].body).toBe('@bot hello');
+    expect(seen[0].mentionedIds).toEqual([user]);
+    expect(seen[0].quotedMessageId).toBe('quoted-id');
+    expect(service.getSelfIds()).toContain(user);
+  });
+
+  it('keeps storing and telling other listeners when one listener fails', async () => {
+    const { service, sockets } = await connected();
+    const seen: string[] = [];
+    service.onMessage(() => { throw new Error('listener failed'); });
+    service.onMessage(message => seen.push(message.body));
+    sockets[0].ev.emit('messages.upsert', { type: 'notify', messages: [oldMessage({ id: 'live-2' }, 'still here')] });
+    await vi.waitFor(() => expect(seen).toEqual(['still here']));
+    expect((await service.getMessages(peer, 10)).some(message => message.body === 'still here')).toBe(true);
+  });
+
+  it('sends a reaction to the exact message', async () => {
+    const { service, sockets } = await connected();
+    const key = { id: 'target', remoteJid: group, participant: peer, fromMe: false };
+    await service.sendReaction(encodeMessageId(key), '💭');
+    expect(sockets[0].sendMessage).toHaveBeenCalledWith(group, { react: { text: '💭', key } });
+  });
+});

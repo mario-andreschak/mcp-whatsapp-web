@@ -31,6 +31,10 @@ export interface SimpleMessage {
   hasMedia: boolean;
   mediaKey?: string;
   type: string;
+  /** Accounts mentioned in this message, when the backend reports them. */
+  mentionedIds?: string[];
+  /** The message this one replies to, when the backend reports it. */
+  quotedMessageId?: string;
 }
 
 export interface SentMessage {
@@ -70,6 +74,12 @@ export interface WhatsAppBackend {
   waitForAuthOutcome(timeoutMs?: number): Promise<void>;
   ensureReady(timeoutMs?: number): Promise<void>;
   onSessionInvalidated(listener: () => void): void;
+  /** New messages as they arrive; history sync does not trigger this. Baileys only for now. */
+  onMessage?(listener: (message: SimpleMessage) => void): void;
+  /** This account's identifiers, to recognise mentions of it. */
+  getSelfIds?(): string[];
+  /** React to a message; an empty emoji removes the reaction. */
+  sendReaction?(messageId: string, emoji: string): Promise<void>;
   getStatus(): BackendStatus;
   searchContacts(query: string): Promise<SimpleContact[]>;
   getContactById(contactId: string): Promise<SimpleContact | null>;

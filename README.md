@@ -346,3 +346,18 @@ MIT
 ---
 
 This project is a TypeScript port of the original [whatsapp-mcp](https://github.com/lharries/whatsapp-mcp) by [lharries](https://github.com/lharries).
+
+## Use as a library
+
+The Baileys backend can be embedded in another Node.js service, for example a chat gateway that reacts to new messages:
+
+```js
+import { createWhatsAppBackend } from 'mcp-whatsapp-web/backend';
+
+process.env.WHATSAPP_BACKEND = 'baileys';
+const backend = await createWhatsAppBackend();
+backend.onMessage(message => console.log(message.chatId, message.body, message.mentionedIds));
+await backend.initialize();
+```
+
+`onMessage` reports live messages only, never history sync. The warning at the top of this README applies here too.

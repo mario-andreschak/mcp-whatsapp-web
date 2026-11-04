@@ -116,6 +116,7 @@ export class BaileysService implements WhatsAppBackend {
   private readonly groupCache = new Map<string, { value: GroupMetadata; expiresAt: number }>();
   private readonly listeners = new Set<() => void>();
   private readonly detachListeners: Array<() => void> = [];
+  private readonly messageListeners: Array<(message: SimpleMessage) => void> = [];
   private readonly historyRequests = new Map<string, number>();
   private readonly historyInflight = new Map<string, Promise<void>>();
 
@@ -286,7 +287,11 @@ export class BaileysService implements WhatsAppBackend {
       } : {}),
     }))));
     on('chats.delete', chats => store.deleteChats(chats));
-    on('messages.upsert', data => store.upsertMessages(data.messages));
+    on('messages.upsert', data => {
+      store.upsertMessages(data.messages);
+      // Only live messages wake listeners; `append` carries history and offline catch-up.
+      if (data.type === 'notify') for (const raw of data.messages) this.notifyMessage(raw);
+    });
     on('messages.update', updates => store.updateMessages(updates));
     on('messages.delete', data => store.deleteMessages(data));
     on('lid-mapping.update', mapping => store.setLidMapping(mapping.lid, mapping.pn));
@@ -300,6 +305,33 @@ export class BaileysService implements WhatsAppBackend {
     on('groups.upsert', updateGroups);
     on('groups.update', updateGroups);
     on('group-participants.update', update => { this.groupCache.delete(update.id); });
+  }
+
+  onMessage(listener: (message: SimpleMessage) => void): void {
+    this.messageListeners.push(listener);
+  }
+
+  /** A listener failure must not stop persistence or other listeners. */
+  private notifyMessage(raw: WAMessage): void {
+    if (!this.messageListeners.length || !raw.key?.remoteJid || !raw.message) return;
+    let message: SimpleMessage;
+    try { message = this.mapMessage(raw); } catch (error) { log.error('Could not map an incoming message:', error); return; }
+    for (const listener of this.messageListeners) {
+      try { listener(message); } catch (error) { log.error('A message listener failed:', error); }
+    }
+  }
+
+  getSelfIds(): string[] {
+    const user = this.socket?.user;
+    return [user?.id, (user as { lid?: string } | undefined)?.lid]
+      .filter((id): id is string => !!id).map(id => this.normalizeJid(id));
+  }
+
+  async sendReaction(messageId: string, emoji: string): Promise<void> {
+    await this.ensureReady();
+    await this.socket!.sendMessage(this.normalizeJid(decodeMessageId(messageId).remoteJid!), {
+      react: { text: emoji, key: decodeMessageId(messageId) },
+    });
   }
 
   private eventFailure(error: unknown, generation: number): void {
@@ -693,8 +725,13 @@ export class BaileysService implements WhatsAppBackend {
     const body = content?.conversation ?? content?.extendedTextMessage?.text
       ?? content?.imageMessage?.caption ?? content?.videoMessage?.caption ?? content?.documentMessage?.caption
       ?? content?.contactMessage?.displayName ?? content?.locationMessage?.name ?? '';
+    const context = (content as { extendedTextMessage?: { contextInfo?: { mentionedJid?: string[] | null; stanzaId?: string | null } } } | null | undefined)?.extendedTextMessage?.contextInfo
+      ?? media?.contextInfo;
+    const mentioned = context?.mentionedJid?.map(id => this.normalizeJid(id));
     return {
       id: encodeMessageId(raw.key), chatId, body,
+      ...(mentioned?.length ? { mentionedIds: mentioned } : {}),
+      ...(context?.stanzaId ? { quotedMessageId: context.stanzaId } : {}),
       from: fromMe ? self : this.normalizeJid(raw.key.participant || chatId),
       to: fromMe || chatId.endsWith('@g.us') ? chatId : self,
       timestamp: timestamp(raw.messageTimestamp), fromMe, hasMedia: !!media,
