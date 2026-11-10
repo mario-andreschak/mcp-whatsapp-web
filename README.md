@@ -117,6 +117,28 @@ On macOS/Linux, the equivalent installation command is `PUPPETEER_SKIP_DOWNLOAD=
 
 The Baileys backend is opt-in and pinned to `7.0.0-rc14`. Review upstream changes before upgrading, especially authentication and message-format migrations. See the [Baileys documentation](https://baileys.wiki/) and [release history](https://github.com/WhiskeySockets/Baileys/releases).
 
+### Voice notes
+
+Voice notes arrive as audio, so on their own they show up as `"type": "ptt"` with an empty body. Transcription is off by default; to turn it on, point `WHATSAPP_TRANSCRIBE_COMMAND` at a speech-to-text command. The server converts each voice note to a 16 kHz mono WAV file, runs the command once per batch with the file paths appended, and reads one JSON line per file:
+
+```json
+{"file": "C:\\Temp\\wa-voice-x\\0.wav", "text": "Hallo zusammen, kurz zum Termin morgen ..."}
+```
+
+A command given a single file may also print plain text. Any engine works this way (faster-whisper, whisper.cpp, a script calling a hosted API). The command decides where the audio goes: a local engine keeps voice notes on the machine.
+
+`examples/transcribe-faster-whisper.py` is a ready-made local command (`pip install faster-whisper`). It reads `WHISPER_MODEL` (default `large-v3`), `WHISPER_DEVICE`, `WHISPER_COMPUTE_TYPE`, `WHISPER_LANGUAGE` and `WHISPER_PROMPT` (names and terms that often come up), for example:
+
+```dotenv
+WHATSAPP_TRANSCRIBE_COMMAND=C:/whisper/venv/Scripts/python.exe C:/path/to/mcp-whatsapp-web/examples/transcribe-faster-whisper.py
+WHISPER_DEVICE=cuda
+WHISPER_COMPUTE_TYPE=int8_float16
+WHISPER_LANGUAGE=de
+HF_HUB_OFFLINE=1
+```
+
+Then `list_messages` with `transcribe_voice_notes: true` returns each voice note with a `transcript` field (or `transcriptError`), and `transcribe_voice_notes` transcribes given message IDs. Each voice note is transcribed once: the Baileys backend stores transcripts beside the chat history and deletes them with their message, on chat deletion and on logout; web.js keeps them for the life of the process. Only one transcription runs at a time. The first batch includes loading the model, so allow a few minutes (`WHATSAPP_TRANSCRIBE_TIMEOUT_MS`, default 15 minutes).
+
 ### Installation with FLUJO
 
 [FLUJO](https://github.com/mario-andreschak/FLUJO/) provides a streamlined installation process:
@@ -260,9 +282,10 @@ This is particularly useful when:
 - `get_direct_chat_by_contact`- Find a direct chat with a specific contact
 
 ### Messages
-- `list_messages`- Retrieve messages with optional filters
+- `list_messages`- Retrieve messages with optional filters; `transcribe_voice_notes: true` adds the text of voice notes
 - `get_message`- Get a specific message by ID
 - `send_message`- Send a text message to a chat
+- `transcribe_voice_notes`- Turn voice notes into text with a local speech-to-text command (see [Voice notes](#voice-notes))
 
 ### Media
 - `send_file`- Send a file (image, video, document) to a chat

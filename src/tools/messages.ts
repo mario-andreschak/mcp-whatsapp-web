@@ -3,6 +3,7 @@ import { z } from 'zod';
 import type { WhatsAppBackend } from '../services/backend.js'; // Removed unused SimpleMessage import
 import { log } from '../utils/logger.js';
 import { CallToolResult } from '@modelcontextprotocol/sdk/types.js';
+import { NOT_CONFIGURED, transcriberFor } from '../services/transcriber.js';
 
 
 export function registerMessageTools(
@@ -13,16 +14,19 @@ export function registerMessageTools(
 
   server.tool(
     'list_messages',
-    'Get WhatsApp messages from a specific chat. This is the source of truth for actual message content: use it whenever the question is about what someone said/wrote. Entries include non-text events too (check the "type" field: "chat" = text message, "call_log" = call, "ptt" = voice note, "image"/"video" = media; non-text entries may have an empty "body").',
+    'Get WhatsApp messages from a specific chat. This is the source of truth for actual message content: use it whenever the question is about what someone said/wrote. Entries include non-text events too (check the "type" field: "chat" = text message, "call_log" = call, "ptt" = voice note, "image"/"video" = media; non-text entries may have an empty "body"). Voice notes carry their text in "transcript" once transcribed; set transcribe_voice_notes to transcribe the missing ones (needs WHATSAPP_TRANSCRIBE_COMMAND, can take minutes).',
     {
       chat_id: z.string().describe('The JID of the chat to retrieve messages from (e.g., 123456789@c.us or 123456789-12345678@g.us)'),
       limit: z.number().int().positive().optional().default(50).describe('Maximum number of messages to return'),
+      transcribe_voice_notes: z.boolean().optional().default(false)
+        .describe('Transcribe voice notes in the result that have no transcript yet. Stored transcripts are always included.'),
       // Note: whatsapp-web.js fetchMessages doesn't support date/sender/query filtering directly.
       // Filtering would need to be done after fetching.
     },
-    async ({ chat_id, limit }): Promise<CallToolResult> => {
+    async ({ chat_id, limit, transcribe_voice_notes }): Promise<CallToolResult> => {
       try {
-        const messages = await whatsappService.getMessages(chat_id, limit);
+        const messages = await transcriberFor(whatsappService)
+          .annotate(await whatsappService.getMessages(chat_id, limit), transcribe_voice_notes);
         // Return the simplified message structure
         return {
           content: [{ type: 'text', text: JSON.stringify(messages, null, 2) }],
@@ -52,8 +56,9 @@ export function registerMessageTools(
                     isError: true,
                 };
             }
+            const [annotated] = await transcriberFor(whatsappService).annotate([message], false);
             return {
-                content: [{ type: 'text', text: JSON.stringify(message, null, 2) }],
+                content: [{ type: 'text', text: JSON.stringify(annotated, null, 2) }],
             };
         } catch (error: any) {
             log.error(`Error in get_message_by_id tool for ID ${message_id}:`, error);
@@ -63,6 +68,31 @@ export function registerMessageTools(
             };
         }
     }
+  );
+
+  server.tool(
+    'transcribe_voice_notes',
+    'Turn WhatsApp voice notes into text with the speech-to-text command configured in WHATSAPP_TRANSCRIBE_COMMAND. Takes message IDs of "ptt" or "audio" messages from list_messages. Each voice note is transcribed once and stored; repeated calls return the stored text. A batch can take minutes.',
+    {
+      message_ids: z.array(z.string()).min(1).max(100).describe('Opaque message IDs of voice notes'),
+    },
+    async ({ message_ids }): Promise<CallToolResult> => {
+      const transcriber = transcriberFor(whatsappService);
+      if (!transcriber.configured) return { content: [{ type: 'text', text: NOT_CONFIGURED }], isError: true };
+      try {
+        const results = await transcriber.transcribe(message_ids);
+        return {
+          content: [{ type: 'text', text: JSON.stringify(results, null, 2) }],
+          ...(results.every(result => result.error) ? { isError: true } : {}),
+        };
+      } catch (error) {
+        log.error('Error in transcribe_voice_notes tool:', error);
+        return {
+          content: [{ type: 'text', text: `Error transcribing voice notes: ${error instanceof Error ? error.message : String(error)}` }],
+          isError: true,
+        };
+      }
+    },
   );
 
   // get_message_context is complex with whatsapp-web.js as it requires fetching messages around a specific one.

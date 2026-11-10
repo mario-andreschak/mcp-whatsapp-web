@@ -312,6 +312,21 @@ describe('Baileys persisted history and opaque IDs', () => {
     expect(message.to).toBe(group);
   });
 
+  it('keeps voice-note transcripts beside the message and drops them with it', async () => {
+    const { service, socket } = await connected();
+    const note: WAMessage = { ...oldMessage({ remoteJid: group, id: 'voice' }), participant: peer,
+      message: { audioMessage: { ptt: true, mimetype: 'audio/ogg; codecs=opus' } } };
+    sync(socket, [note, oldMessage({ remoteJid: group, id: 'other' }, 'text')]);
+    const [voice] = (await service.getMessages(group, 5)).filter(message => message.type === 'ptt');
+    expect(service.getVoiceTranscript(voice.id)).toBeUndefined();
+    service.saveVoiceTranscript(voice.id, 'Hallo zusammen');
+    socket.ev.emit('messages.update', [{ key: note.key, update: { status: 4 } }]);
+    expect(service.getVoiceTranscript(voice.id)).toBe('Hallo zusammen');
+    socket.ev.emit('messages.delete', { keys: [note.key] });
+    expect(service.getVoiceTranscript(voice.id)).toBeUndefined();
+    expect(service.getVoiceTranscript('not-an-id')).toBeUndefined();
+  });
+
   it('persists LID aliases and retains previously returned IDs after account restart', async () => {
     const { service, socket, directory } = await connected();
     const lid = '999888777@lid';
