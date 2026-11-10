@@ -110,6 +110,16 @@ export class BaileysStore {
         CREATE INDEX IF NOT EXISTS messages_by_participant ON messages (participant);
         CREATE TABLE IF NOT EXISTS jid_aliases (alias TEXT PRIMARY KEY, canonical TEXT NOT NULL);
         CREATE TABLE IF NOT EXISTS metadata (key TEXT PRIMARY KEY, data TEXT NOT NULL);
+        CREATE TABLE IF NOT EXISTS transcripts (
+          chat_id TEXT NOT NULL, message_id TEXT NOT NULL, from_me INTEGER NOT NULL,
+          participant TEXT NOT NULL, text TEXT NOT NULL, created_at INTEGER NOT NULL,
+          PRIMARY KEY (chat_id, message_id, from_me, participant)
+        );
+        -- A transcript never outlives its voice note.
+        CREATE TRIGGER IF NOT EXISTS transcripts_follow_messages AFTER DELETE ON messages BEGIN
+          DELETE FROM transcripts WHERE chat_id = OLD.chat_id AND message_id = OLD.message_id
+            AND from_me = OLD.from_me AND participant = OLD.participant;
+        END;
       `);
     } catch (error) {
       // A rejected contender must never release the real owner's lease.
@@ -360,6 +370,25 @@ export class BaileysStore {
     return rows.length === 1 ? restoreMessage(rows[0].data) : undefined;
   }
 
+  getTranscript(key: WAMessageKey): string | undefined {
+    const rows = this.findMessageRows(key);
+    if (rows.length !== 1) return undefined;
+    const row = rows[0];
+    const found = this.db.prepare('SELECT text FROM transcripts WHERE chat_id = ? AND message_id = ? AND from_me = ? AND participant = ?')
+      .get(row.chat_id, row.message_id, row.from_me, row.participant) as { text: string } | undefined;
+    return found?.text;
+  }
+
+  /** Stored only for a known message, so deleting the message also deletes its transcript. */
+  setTranscript(key: WAMessageKey, text: string): boolean {
+    const rows = this.findMessageRows(key);
+    if (rows.length !== 1) return false;
+    const row = rows[0];
+    this.db.prepare('INSERT OR REPLACE INTO transcripts (chat_id, message_id, from_me, participant, text, created_at) VALUES (?, ?, ?, ?, ?, ?)')
+      .run(row.chat_id, row.message_id, row.from_me, row.participant, text, Date.now());
+    return true;
+  }
+
   updateMessages(updates: { key: WAMessageKey; update: Partial<WAMessage> }[]): void {
     this.transaction(() => {
       for (const { key, update } of updates) {
@@ -475,7 +504,7 @@ export class BaileysStore {
   /** Explicit logout erases credentials and all account history; reconnects must use close(). */
   clear(): void {
     this.transaction(() => {
-      for (const table of ['credentials', 'signal_keys', 'messages', 'chats', 'contacts', 'jid_aliases', 'metadata']) {
+      for (const table of ['credentials', 'signal_keys', 'messages', 'transcripts', 'chats', 'contacts', 'jid_aliases', 'metadata']) {
         this.db.exec(`DELETE FROM ${table}`);
       }
     });

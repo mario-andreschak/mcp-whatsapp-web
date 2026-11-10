@@ -644,6 +644,15 @@ export class BaileysService implements WhatsAppBackend {
     return message ? this.mapMessage(message) : null;
   }
 
+  getVoiceTranscript(id: string): string | undefined {
+    if (!this.store) return undefined;
+    try { return this.store.getTranscript(decodeMessageId(id)); } catch { return undefined; }
+  }
+
+  saveVoiceTranscript(id: string, text: string): void {
+    this.store?.setTranscript(decodeMessageId(id), text);
+  }
+
   async sendMessage(to: string, content: string): Promise<SentMessage> {
     return this.sendContent(to, { text: content });
   }

@@ -35,6 +35,10 @@ export interface SimpleMessage {
   mentionedIds?: string[];
   /** The message this one replies to, when the backend reports it. */
   quotedMessageId?: string;
+  /** Text of a voice note, when transcription is configured and it has been transcribed. */
+  transcript?: string;
+  /** Why a requested transcription failed. */
+  transcriptError?: string;
 }
 
 export interface SentMessage {
@@ -78,6 +82,9 @@ export interface WhatsAppBackend {
   onMessage?(listener: (message: SimpleMessage) => void): void;
   /** This account's identifiers, to recognise mentions of it. */
   getSelfIds?(): string[];
+  /** Stored transcript of a voice note, for backends that persist them beside the history. */
+  getVoiceTranscript?(messageId: string): string | undefined;
+  saveVoiceTranscript?(messageId: string, text: string): void;
   /** React to a message; an empty emoji removes the reaction. */
   sendReaction?(messageId: string, emoji: string): Promise<void>;
   getStatus(): BackendStatus;
