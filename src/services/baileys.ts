@@ -2,6 +2,7 @@ import makeWASocket, {
   Browsers,
   DisconnectReason,
   downloadMediaMessage,
+  fetchLatestWaWebVersion,
   getContentType,
   jidNormalizedUser,
   normalizeMessageContent,
@@ -14,6 +15,7 @@ import makeWASocket, {
   type WAMessage,
   type WAMessageKey,
   type WASocket,
+  type WAVersion,
 } from '@whiskeysockets/baileys';
 import { readFile, stat } from 'node:fs/promises';
 import path from 'node:path';
@@ -35,6 +37,29 @@ export interface BaileysServiceDeps {
   downloadMedia?: typeof downloadMediaMessage;
   reconnectDelayMs?: number;
   historyRequestTimeoutMs?: number;
+  /** Current WhatsApp Web version; defaults to a lookup unless a socket factory is injected. */
+  resolveVersion?: () => Promise<WAVersion | undefined>;
+}
+
+/** Parses "2.3000.1053895232" into a Baileys version tuple. */
+export function parseWaVersion(value: string | undefined): WAVersion | undefined {
+  const parts = value?.trim().split('.').map(Number);
+  if (!parts || parts.length !== 3 || !parts.every(part => Number.isInteger(part) && part >= 0)) return undefined;
+  return parts as WAVersion;
+}
+
+/**
+ * How this server appears under Linked devices. WhatsApp currently ends new links that
+ * claim to be the "Desktop" app (status 428), so the default is "Chrome", which links but
+ * receives recent history only. BAILEYS_BROWSER=Desktop asks for the full history again.
+ */
+export function linkedDeviceBrowser(app = process.env.BAILEYS_BROWSER?.trim() || 'Chrome'): [string, string, string] {
+  return process.platform === 'darwin' ? Browsers.macOS(app) : Browsers.windows(app);
+}
+
+async function fetchCurrentWaWebVersion(): Promise<WAVersion | undefined> {
+  const { version, isLatest } = await fetchLatestWaWebVersion({ signal: AbortSignal.timeout(10_000) });
+  return isLatest ? version : undefined;
 }
 
 const MAX_RECONNECT_ATTEMPTS = 8;
@@ -117,6 +142,7 @@ export class BaileysService implements WhatsAppBackend {
   private readonly listeners = new Set<() => void>();
   private readonly detachListeners: Array<() => void> = [];
   private readonly messageListeners: Array<(message: SimpleMessage) => void> = [];
+  private waVersion?: WAVersion;
   private readonly historyRequests = new Map<string, number>();
   private readonly historyInflight = new Map<string, Promise<void>>();
 
@@ -159,9 +185,33 @@ export class BaileysService implements WhatsAppBackend {
     return pending;
   }
 
+  /**
+   * WhatsApp refuses new links from clients that report an outdated web version, so the
+   * version Baileys ships with stops working a few weeks after each release. Look up the
+   * current one once per process; WA_WEB_VERSION pins it, and a failed lookup falls back
+   * to the Baileys default instead of blocking the connection.
+   */
+  private async clientVersion(): Promise<WAVersion | undefined> {
+    if (this.waVersion) return this.waVersion;
+    const pinned = parseWaVersion(process.env.WA_WEB_VERSION);
+    if (pinned) return (this.waVersion = pinned);
+    if (process.env.WA_WEB_VERSION?.trim()) log.warn(`Ignoring WA_WEB_VERSION '${process.env.WA_WEB_VERSION}': expected a form like 2.3000.1053895232.`);
+    const resolve = this.deps.resolveVersion ?? (this.deps.socketFactory ? undefined : fetchCurrentWaWebVersion);
+    if (!resolve) return undefined;
+    try {
+      const found = await resolve();
+      if (found) this.waVersion = found;
+      return found;
+    } catch (error) {
+      log.warn('Could not look up the current WhatsApp Web version; using the Baileys default.', error);
+      return undefined;
+    }
+  }
+
   private async openSocket(intent: number): Promise<void> {
     const store = this.requireStore();
     const { state, saveCreds } = await store.createAuthState();
+    const version = await this.clientVersion();
     if (intent !== this.intent || this.stopped) return;
     const generation = ++this.generation;
     const withCurrentAuth = async <T>(operation: () => T | Promise<T>): Promise<T> => {
@@ -178,8 +228,9 @@ export class BaileysService implements WhatsAppBackend {
           set: data => withCurrentAuth(() => state.keys.set(data)),
         },
       },
+      ...(version ? { version } : {}),
       logger: log,
-      browser: process.platform === 'win32' ? Browsers.windows('Desktop') : Browsers.macOS('Desktop'),
+      browser: linkedDeviceBrowser(),
       syncFullHistory: true,
       markOnlineOnConnect: false,
       connectTimeoutMs: 30_000,

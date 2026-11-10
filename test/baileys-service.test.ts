@@ -4,8 +4,10 @@ import { Readable } from 'node:stream';
 import { mkdtempSync, rmSync } from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
-import { DisconnectReason, type UserFacingSocketConfig, type WAMessage, type WAMessageKey } from '@whiskeysockets/baileys';
-import { BaileysService, decodeMessageId, encodeMessageId, type BaileysSocket } from '../src/services/baileys.js';
+import { DisconnectReason, type UserFacingSocketConfig, type WAMessage, type WAMessageKey, type WAVersion } from '@whiskeysockets/baileys';
+import {
+  BaileysService, decodeMessageId, encodeMessageId, linkedDeviceBrowser, parseWaVersion, type BaileysSocket,
+} from '../src/services/baileys.js';
 import { BaileysStore } from '../src/services/baileys-store.js';
 
 vi.mock('../src/utils/logger.js', () => ({ log: { info: vi.fn(), debug: vi.fn(), warn: vi.fn(), error: vi.fn() } }));
@@ -20,7 +22,7 @@ const oldMessage = (key: Partial<WAMessageKey> = {}, body = 'hello', time = 1700
   message: { conversation: body }, messageTimestamp: time,
 });
 
-function fixture(options: { directory?: string; requestTimeout?: number } = {}) {
+function fixture(options: { directory?: string; requestTimeout?: number; resolveVersion?: () => Promise<WAVersion | undefined> } = {}) {
   const directory = options.directory ?? mkdtempSync(path.join(os.tmpdir(), 'wa-baileys-service-'));
   if (!options.directory) directories.push(directory);
   const sockets: ReturnType<typeof fakeSocket>[] = [];
@@ -33,7 +35,8 @@ function fixture(options: { directory?: string; requestTimeout?: number } = {}) 
   });
   const downloadMedia = vi.fn(async () => Readable.from([Buffer.from('downloaded')]));
   const service = new BaileysService({ sessionDir: directory, socketFactory,
-    downloadMedia: downloadMedia as never, reconnectDelayMs: 1, historyRequestTimeoutMs: options.requestTimeout ?? 25 });
+    downloadMedia: downloadMedia as never, reconnectDelayMs: 1, historyRequestTimeoutMs: options.requestTimeout ?? 25,
+    ...(options.resolveVersion ? { resolveVersion: options.resolveVersion } : {}) });
   services.push(service);
   return { service, sockets, configs, socketFactory, directory, downloadMedia };
 }
@@ -85,6 +88,36 @@ describe('Baileys lifecycle and authentication (offline)', () => {
     expect(configs[0].syncFullHistory).toBe(true);
     expect(configs[0].markOnlineOnConnect).toBe(false);
     expect(service.isAuthenticated()).toBe(false);
+  });
+
+  it('links as a Chrome device by default, since WhatsApp ends new Desktop links', async () => {
+    const { service, configs } = fixture();
+    await service.initialize();
+    expect(configs[0].browser?.[1]).toBe('Chrome');
+    vi.stubEnv('BAILEYS_BROWSER', 'Desktop');
+    try { expect(linkedDeviceBrowser()[1]).toBe('Desktop'); } finally { vi.unstubAllEnvs(); }
+  });
+
+  it('reports the current WhatsApp Web version, honours a pin and survives a failed lookup', async () => {
+    expect(parseWaVersion('2.3000.1053895232')).toEqual([2, 3000, 1053895232]);
+    for (const bad of [undefined, '', '2.3000', '2.x.1', '2.3000.1.4', '-1.2.3']) expect(parseWaVersion(bad)).toBeUndefined();
+
+    const resolveVersion = vi.fn(async (): Promise<WAVersion> => [2, 3000, 42]);
+    const looked = fixture({ resolveVersion });
+    await looked.service.initialize();
+    expect(looked.configs[0].version).toEqual([2, 3000, 42]);
+
+    vi.stubEnv('WA_WEB_VERSION', '2.3000.7');
+    try {
+      const pinned = fixture({ resolveVersion });
+      await pinned.service.initialize();
+      expect(pinned.configs[0].version).toEqual([2, 3000, 7]);
+    } finally { vi.unstubAllEnvs(); }
+    expect(resolveVersion).toHaveBeenCalledTimes(1);
+
+    const failing = fixture({ resolveVersion: async () => { throw new Error('offline'); } });
+    await failing.service.initialize();
+    expect(failing.configs[0].version).toBeUndefined();
   });
 
   it('reports initialization ownership failures promptly and preserves their useful error', async () => {

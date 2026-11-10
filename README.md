@@ -94,6 +94,8 @@ BAILEYS_SESSION_DIR=C:/path/to/your/baileys-sessions
 
 `BAILEYS_SESSION_DIR` defaults to `<working directory>/baileys-sessions`; the example above should be replaced with your own absolute directory. Pair this backend separately with `get_qr_code` or `request_pairing_code`. The existing `WHATSAPP_PAIRING_PHONE_NUMBER` option also works. Baileys cannot reuse the web.js browser profile. You can switch back to `webjs` and resume its existing session.
 
+Baileys links as a Chrome device (shown as "Chrome (Windows)" or "Chrome (Mac OS)" under Linked devices). WhatsApp currently ends new links that claim to be the Desktop app with status 428 ("Connection Terminated") before a QR code appears. Desktop would request the full chat history; Chrome receives recent history, and live messages are stored from then on. `BAILEYS_BROWSER=Desktop` restores the old behaviour. At startup the backend also looks up the current WhatsApp Web version from `web.whatsapp.com`, because WhatsApp refuses clients that report an outdated one; `WA_WEB_VERSION` pins it, and a failed lookup falls back to the version bundled with Baileys.
+
 Baileys and SQLite are pinned optional dependencies installed by normal `npm install`. If your package manager omitted them, run `npm install --include=optional`. SQLite uses a native addon; a supported prebuilt binary or a local native build toolchain is required. To avoid downloading Chromium when installing for Baileys or an existing system browser, use:
 
 ```powershell
