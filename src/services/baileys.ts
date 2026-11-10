@@ -783,7 +783,8 @@ export class BaileysService implements WhatsAppBackend {
       id: encodeMessageId(raw.key), chatId, body,
       ...(mentioned?.length ? { mentionedIds: mentioned } : {}),
       ...(context?.stanzaId ? { quotedMessageId: context.stanzaId } : {}),
-      from: fromMe ? self : this.normalizeJid(raw.key.participant || chatId),
+      // History sync puts a group sender in `participant` beside the key, live messages in the key.
+      from: fromMe ? self : this.normalizeJid(raw.key.participant || raw.participant || chatId),
       to: fromMe || chatId.endsWith('@g.us') ? chatId : self,
       timestamp: timestamp(raw.messageTimestamp), fromMe, hasMedia: !!media,
       ...(media?.mediaKey ? { mediaKey: Buffer.from(media.mediaKey).toString('base64') } : {}),

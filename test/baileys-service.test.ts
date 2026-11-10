@@ -303,6 +303,15 @@ describe('Baileys persisted history and opaque IDs', () => {
     await expect(service.getMessageById('false_whatsapp-web-message')).rejects.toThrow('Invalid Baileys message ID');
   });
 
+  it('reports the sender of synced group messages that carry it outside the key', async () => {
+    const { service, socket } = await connected();
+    const synced: WAMessage = { ...oldMessage({ remoteJid: group, id: 'synced' }, 'from history'), participant: peer };
+    sync(socket, [synced]);
+    const [message] = await service.getMessages(group, 1);
+    expect(message.from).toBe(peer);
+    expect(message.to).toBe(group);
+  });
+
   it('persists LID aliases and retains previously returned IDs after account restart', async () => {
     const { service, socket, directory } = await connected();
     const lid = '999888777@lid';
