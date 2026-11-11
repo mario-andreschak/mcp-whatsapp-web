@@ -5,7 +5,7 @@ import type { BaileysStore, StoredEvent, StoredEventSubscription } from './baile
 import { log } from '../utils/logger.js';
 
 /**
- * Message events over signed webhooks.
+ * Message and call events over signed webhooks.
  *
  * Follows the webhook part of the MCP events draft (`events/list`, `events/subscribe`,
  * `events/unsubscribe`) and Standard Webhooks signing. One durable log serves both kinds of
@@ -14,8 +14,40 @@ import { log } from '../utils/logger.js';
  *
  * These are protocol methods on purpose, not tools. A model can call a tool, and a message
  * could talk it into subscribing somewhere else; it cannot call `events/subscribe`.
+ *
+ * Calls use the same log, but only while they matter: a `call.received` is recorded for a
+ * live offer that is at most a minute old, and dropped rather than delivered late. The
+ * matching `call.ended` is delivered like a message, so a receiver always learns the outcome.
  */
 export const MESSAGE_RECEIVED = 'message.received';
+export const CALL_RECEIVED = 'call.received';
+export const CALL_ENDED = 'call.ended';
+export const EVENT_NAMES: readonly string[] = [MESSAGE_RECEIVED, CALL_RECEIVED, CALL_ENDED];
+const CALL_EVENTS = new Set([CALL_RECEIVED, CALL_ENDED]);
+/** How long a call offer is worth announcing. WhatsApp rings for about that long. */
+export const CALL_FRESH_MS = 60_000;
+
+export type CallEndReason = 'missed' | 'rejected' | 'answered_elsewhere' | 'ended';
+
+export interface CallContact {
+  id: string;
+  /** The name saved in the address book, if any. */
+  name: string | null;
+  /** The name the caller chose in WhatsApp, or empty. */
+  pushname: string;
+  /** Phone number digits, or empty when only a private id is known. */
+  number: string;
+  isMyContact: boolean;
+}
+
+export interface CallDetails {
+  callId: string;
+  chatId: string;
+  from: string;
+  isVideo: boolean;
+  isGroup: boolean;
+  contact: CallContact;
+}
 
 const DELIVERABLE_TYPES = new Set(['chat', 'ptt', 'audio', 'image', 'video', 'document', 'sticker', 'location', 'contact']);
 const RETRY_DELAYS_MS = [5_000, 30_000, 120_000, 600_000, 1_800_000, 3_600_000];
@@ -102,6 +134,27 @@ function validateUrl(value: string): void {
   if (url.protocol !== 'https:') throw new EventRequestError(INVALID_PARAMS, 'A delivery.url on another host must use https.');
 }
 
+function parseData(data: string | null): Record<string, unknown> | null {
+  if (!data) return null;
+  try {
+    const parsed: unknown = JSON.parse(data);
+    return parsed && typeof parsed === 'object' ? parsed as Record<string, unknown> : null;
+  } catch { return null; }
+}
+
+/**
+ * What the operator-configured webhook receives. Defaults to messages only, as before
+ * call events existed; WHATSAPP_WEBHOOK_EVENTS opts in to more.
+ */
+export function environmentEventNames(value = process.env.WHATSAPP_WEBHOOK_EVENTS): string[] {
+  const requested = value?.split(',').map(name => name.trim()).filter(Boolean) ?? [];
+  if (!requested.length) return [MESSAGE_RECEIVED];
+  const unknown = requested.filter(name => !EVENT_NAMES.includes(name));
+  if (unknown.length) log.warn(`WHATSAPP_WEBHOOK_EVENTS: ignoring unknown event(s) ${unknown.join(', ')}. Known: ${EVENT_NAMES.join(', ')}.`);
+  const known = [...new Set(requested.filter(name => EVENT_NAMES.includes(name)))];
+  return known.length ? known : [MESSAGE_RECEIVED];
+}
+
 export class MessageEvents {
   private readonly fetcher: typeof fetch;
   private readonly now: () => number;
@@ -135,6 +188,12 @@ export class MessageEvents {
   }
 
   list(): { events: unknown[] } {
+    const chatIds = { type: 'array', items: { type: 'string' }, description: 'Only these chats. Omit for all chats.' };
+    const callSchema = {
+      type: 'object',
+      additionalProperties: false,
+      properties: { chat_ids: { ...chatIds, description: 'Only calls from these chats or callers. Omit for all calls.' } },
+    };
     return {
       events: [{
         name: MESSAGE_RECEIVED,
@@ -144,10 +203,20 @@ export class MessageEvents {
           type: 'object',
           additionalProperties: false,
           properties: {
-            chat_ids: { type: 'array', items: { type: 'string' }, description: 'Only these chats. Omit for all chats.' },
+            chat_ids: chatIds,
             include_own: { type: 'boolean', default: false, description: "Also deliver this account's own messages." },
           },
         },
+      }, {
+        name: CALL_RECEIVED,
+        description: 'A WhatsApp voice or video call is ringing now, with the caller\'s saved name, WhatsApp name and number. Only live calls: one missed while this server was offline, or not delivered within a minute, is never sent.',
+        delivery: ['webhook'],
+        inputSchema: callSchema,
+      }, {
+        name: CALL_ENDED,
+        description: 'A call announced by call.received stopped ringing. reason is missed, rejected, answered_elsewhere or ended.',
+        delivery: ['webhook'],
+        inputSchema: callSchema,
       }],
     };
   }
@@ -166,12 +235,15 @@ export class MessageEvents {
     return { chatIds, includeOwn: args?.include_own === true };
   }
 
-  private assertKnownEvent(name: string): void {
-    if (name !== MESSAGE_RECEIVED) throw new EventRequestError(NOT_FOUND, `Unknown event '${name}'.`);
+  private assertKnownEvent(name: string, args?: MessageEventArguments): void {
+    if (!EVENT_NAMES.includes(name)) throw new EventRequestError(NOT_FOUND, `Unknown event '${name}'.`);
+    if (CALL_EVENTS.has(name) && args?.include_own !== undefined) {
+      throw new EventRequestError(INVALID_PARAMS, `include_own does not apply to ${name}.`);
+    }
   }
 
   subscribe(request: SubscribeRequest): { id: string; refreshBefore: string; cursor: string; truncated: boolean } {
-    this.assertKnownEvent(request.name);
+    this.assertKnownEvent(request.name, request.arguments);
     validateUrl(request.delivery.url);
     validateSecret(request.delivery.secret);
     const { chatIds, includeOwn } = this.resolveFilter(request.arguments);
@@ -180,7 +252,7 @@ export class MessageEvents {
     const ttl = Math.min(MAX_TTL_MS, Math.max(MIN_TTL_MS, request.ttlMs ?? DEFAULT_TTL_MS));
     const existing = this.store.getEventSubscription(id);
     this.store.saveEventSubscription({
-      id, url: request.delivery.url, secret: request.delivery.secret, chatIds, includeOwn,
+      id, url: request.delivery.url, secret: request.delivery.secret, names: [request.name], chatIds, includeOwn,
       cursor: existing?.cursor ?? this.store.latestEventSeq(), expiresAt: now + ttl, active: true,
       createdAt: existing?.createdAt ?? now,
     });
@@ -195,7 +267,7 @@ export class MessageEvents {
   }
 
   unsubscribe(request: { name: string; arguments?: MessageEventArguments; delivery: { url: string } }): Record<string, never> {
-    this.assertKnownEvent(request.name);
+    this.assertKnownEvent(request.name, request.arguments);
     const { chatIds, includeOwn } = this.resolveFilter(request.arguments);
     const id = this.subscriptionId(request.delivery.url, request.name, chatIds, includeOwn);
     if (!this.store.getEventSubscription(id)) throw new EventRequestError(NOT_FOUND, 'No matching subscription.');
@@ -222,7 +294,7 @@ export class MessageEvents {
       });
       const existing = this.store.getEventSubscription(ENV_SUBSCRIPTION_ID);
       this.store.saveEventSubscription({
-        id: ENV_SUBSCRIPTION_ID, url, secret, chatIds, includeOwn,
+        id: ENV_SUBSCRIPTION_ID, url, secret, names: environmentEventNames(), chatIds, includeOwn,
         cursor: existing?.cursor ?? this.store.latestEventSeq(), expiresAt: null, active: true,
         createdAt: existing?.createdAt ?? this.now(),
       });
@@ -231,12 +303,45 @@ export class MessageEvents {
     }
   }
 
-  hasSubscriptions(): boolean {
-    return this.store.getEventSubscriptions().some(sub => sub.active);
+  /** Whether any active subscription wants `name`, or any event at all. */
+  hasSubscriptions(name?: string): boolean {
+    return this.store.getEventSubscriptions().some(sub => sub.active && (!name || sub.names.includes(name)));
   }
 
-  private matches(sub: StoredEventSubscription, chatId: string, fromMe: boolean): boolean {
-    return (sub.includeOwn || !fromMe) && (sub.chatIds === null || sub.chatIds.includes(chatId));
+  private matches(sub: StoredEventSubscription, name: string, chatIds: string[], fromMe: boolean): boolean {
+    return sub.names.includes(name) && (sub.includeOwn || !fromMe)
+      && (sub.chatIds === null || chatIds.some(id => sub.chatIds!.includes(id)));
+  }
+
+  /** A call matches a chat filter by its chat or its caller. */
+  private eventChats(event: StoredEvent): string[] {
+    if (!CALL_EVENTS.has(event.name)) return [event.chatId];
+    const from = parseData(event.data)?.from;
+    return typeof from === 'string' ? [event.chatId, from] : [event.chatId];
+  }
+
+  /** A live call offer. Ignored when it is already older than a ringing call can be. */
+  recordCallReceived(call: CallDetails, occurredAt: number): boolean {
+    if (this.now() - occurredAt > CALL_FRESH_MS) return false;
+    const { callId, chatId, from, isVideo, isGroup, contact } = call;
+    return this.recordCall(CALL_RECEIVED, call, occurredAt, { callId, chatId, from, isVideo, isGroup, status: 'ringing', contact });
+  }
+
+  recordCallEnded(call: CallDetails, reason: CallEndReason, occurredAt: number): boolean {
+    const { callId, chatId, from, isVideo, isGroup, contact } = call;
+    return this.recordCall(CALL_ENDED, call, occurredAt, { callId, chatId, from, isVideo, isGroup, reason, contact });
+  }
+
+  private recordCall(name: string, call: CallDetails, occurredAt: number, data: Record<string, unknown>): boolean {
+    const wanted = this.store.getEventSubscriptions()
+      .some(sub => sub.active && this.matches(sub, name, [call.chatId, call.from], false));
+    if (!wanted) return false;
+    const eventId = `evt_${createHash('sha256').update(`${name}:${call.callId}`).digest('hex').slice(0, 32)}`;
+    const added = this.store.appendEvent({
+      eventId, name, chatId: call.chatId, messageId: call.callId, fromMe: false, occurredAt, data: JSON.stringify(data),
+    });
+    if (added) this.wakeAll();
+    return added;
   }
 
   /**
@@ -244,13 +349,13 @@ export class MessageEvents {
    * (offline catch-up, history) only counts if it is younger than a subscription.
    */
   record(messages: SimpleMessage[], live: boolean): void {
-    const subscriptions = this.store.getEventSubscriptions().filter(sub => sub.active);
+    const subscriptions = this.store.getEventSubscriptions().filter(sub => sub.active && sub.names.includes(MESSAGE_RECEIVED));
     if (!subscriptions.length) return;
     let added = false;
     for (const message of [...messages].sort((a, b) => a.timestamp - b.timestamp)) {
       const { chatId } = message;
       if (!chatId || chatId === 'status@broadcast' || !DELIVERABLE_TYPES.has(message.type)) continue;
-      const wanted = subscriptions.some(sub => this.matches(sub, chatId, message.fromMe)
+      const wanted = subscriptions.some(sub => this.matches(sub, MESSAGE_RECEIVED, [chatId], message.fromMe)
         && (live || message.timestamp * 1000 >= sub.createdAt));
       if (!wanted) continue;
       const eventId = `evt_${createHash('sha256').update(message.id).digest('hex').slice(0, 32)}`;
@@ -348,8 +453,16 @@ export class MessageEvents {
     }
   }
 
-  private async deliver(sub: StoredEventSubscription, event: StoredEvent): Promise<Outcome> {
-    if (!this.matches(sub, event.chatId, event.fromMe) || event.occurredAt < sub.createdAt - 60_000) return { kind: 'done' };
+  /** The payload, or null when there is nothing (left) to deliver. */
+  private async payload(event: StoredEvent): Promise<{ data: unknown } | null | 'not-ready'> {
+    if (CALL_EVENTS.has(event.name)) {
+      if (event.name === CALL_RECEIVED && this.now() - event.occurredAt > CALL_FRESH_MS) {
+        log.info(`Dropping ${event.eventId}: the call stopped ringing before the receiver took it.`);
+        return null;
+      }
+      const data = parseData(event.data);
+      return data ? { data } : null;
+    }
     let message: SimpleMessage | null;
     try {
       await this.host.ensureReady(WHATSAPP_WAIT_MS);
@@ -357,13 +470,21 @@ export class MessageEvents {
       if (message) message = await this.host.annotate(message);
     } catch (error) {
       log.debug('WhatsApp is not ready for webhook delivery:', error instanceof Error ? error.message : String(error));
-      return { kind: 'wait', delayMs: WHATSAPP_RETRY_MS };
+      return 'not-ready';
     }
-    if (!message) return { kind: 'done' }; // deleted since it arrived
+    if (!message) return null; // deleted since it arrived
     const { mediaKey: _mediaKey, ...data } = message;
+    return { data };
+  }
+
+  private async deliver(sub: StoredEventSubscription, event: StoredEvent): Promise<Outcome> {
+    if (!this.matches(sub, event.name, this.eventChats(event), event.fromMe) || event.occurredAt < sub.createdAt - 60_000) return { kind: 'done' };
+    const payload = await this.payload(event);
+    if (payload === 'not-ready') return { kind: 'wait', delayMs: WHATSAPP_RETRY_MS };
+    if (!payload) return { kind: 'done' };
     const body = JSON.stringify({
-      eventId: event.eventId, name: MESSAGE_RECEIVED,
-      timestamp: new Date(event.occurredAt).toISOString(), data, cursor: String(event.seq),
+      eventId: event.eventId, name: event.name,
+      timestamp: new Date(event.occurredAt).toISOString(), cursor: String(event.seq), data: payload.data,
     });
     const timestampSeconds = Math.floor(this.now() / 1000);
     let response: Response;

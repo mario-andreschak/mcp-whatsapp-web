@@ -27,10 +27,15 @@ interface MessageRow extends JsonRow {
   timestamp: number;
 }
 
+/** Rows written before call events existed are message events. */
+const DEFAULT_EVENT_NAME = 'message.received';
+
 export interface StoredEventSubscription {
   id: string;
   url: string;
   secret: string;
+  /** Event names this subscription receives. */
+  names: string[];
   chatIds: string[] | null;
   includeOwn: boolean;
   cursor: number;
@@ -42,19 +47,24 @@ export interface StoredEventSubscription {
 export interface StoredEvent {
   seq: number;
   eventId: string;
+  name: string;
   chatId: string;
+  /** The message id for message events, the call id for call events. */
   messageId: string;
   fromMe: boolean;
   occurredAt: number;
+  /** Payload captured when the event happened, for events with nothing else to look up later. */
+  data: string | null;
 }
 
 interface EventSubscriptionRow {
-  id: string; url: string; secret: string; chat_ids: string | null; include_own: number;
+  id: string; url: string; secret: string; names: string | null; chat_ids: string | null; include_own: number;
   cursor: number; expires_at: number | null; active: number; created_at: number;
 }
 
 interface EventRow {
-  seq: number; event_id: string; chat_id: string; message_id: string; from_me: number; occurred_at: number;
+  seq: number; event_id: string; name: string | null; chat_id: string; message_id: string; from_me: number;
+  occurred_at: number; data: string | null;
 }
 
 export interface StoredAuthState {
@@ -159,6 +169,10 @@ export class BaileysStore {
             AND from_me = OLD.from_me AND participant = OLD.participant;
         END;
       `);
+      // Added with call events; older rows default to message events.
+      this.addColumn('event_log', 'name', `TEXT NOT NULL DEFAULT '${DEFAULT_EVENT_NAME}'`);
+      this.addColumn('event_log', 'data', 'TEXT');
+      this.addColumn('event_subscriptions', 'names', 'TEXT');
     } catch (error) {
       // A rejected contender must never release the real owner's lease.
       try { this.db.prepare('DELETE FROM session_owner WHERE token = ?').run(this.ownerToken); } catch { /* schema/open failure */ }
@@ -166,6 +180,11 @@ export class BaileysStore {
       this.closed = true;
       throw error;
     }
+  }
+
+  private addColumn(table: string, column: string, definition: string): void {
+    const columns = this.db.prepare(`PRAGMA table_info(${table})`).all() as Array<{ name: string }>;
+    if (!columns.some(existing => existing.name === column)) this.db.exec(`ALTER TABLE ${table} ADD COLUMN ${column} ${definition}`);
   }
 
   private claimOwnership(): void {
@@ -522,7 +541,9 @@ export class BaileysStore {
 
   private mapEventSubscription(row: EventSubscriptionRow): StoredEventSubscription {
     return {
-      id: row.id, url: row.url, secret: row.secret, chatIds: row.chat_ids === null ? null : JSON.parse(row.chat_ids) as string[],
+      id: row.id, url: row.url, secret: row.secret,
+      names: row.names === null ? [DEFAULT_EVENT_NAME] : JSON.parse(row.names) as string[],
+      chatIds: row.chat_ids === null ? null : JSON.parse(row.chat_ids) as string[],
       includeOwn: row.include_own === 1, cursor: row.cursor, expiresAt: row.expires_at, active: row.active === 1, createdAt: row.created_at,
     };
   }
@@ -540,8 +561,9 @@ export class BaileysStore {
 
   saveEventSubscription(sub: StoredEventSubscription): void {
     this.assertOpen();
-    this.db.prepare(`INSERT OR REPLACE INTO event_subscriptions (id, url, secret, chat_ids, include_own, cursor, expires_at, active, created_at)
-      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`).run(sub.id, sub.url, sub.secret, sub.chatIds === null ? null : JSON.stringify(sub.chatIds),
+    this.db.prepare(`INSERT OR REPLACE INTO event_subscriptions (id, url, secret, names, chat_ids, include_own, cursor, expires_at, active, created_at)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`).run(sub.id, sub.url, sub.secret, JSON.stringify(sub.names),
+      sub.chatIds === null ? null : JSON.stringify(sub.chatIds),
       sub.includeOwn ? 1 : 0, sub.cursor, sub.expiresAt, sub.active ? 1 : 0, sub.createdAt);
   }
 
@@ -561,18 +583,18 @@ export class BaileysStore {
   }
 
   /** False when the event is already in the log. */
-  appendEvent(event: Omit<StoredEvent, 'seq'>): boolean {
+  appendEvent(event: Omit<StoredEvent, 'seq' | 'name' | 'data'> & { name?: string; data?: string | null }): boolean {
     this.assertOpen();
-    return this.db.prepare('INSERT OR IGNORE INTO event_log (event_id, chat_id, message_id, from_me, occurred_at) VALUES (?, ?, ?, ?, ?)')
-      .run(event.eventId, event.chatId, event.messageId, event.fromMe ? 1 : 0, event.occurredAt).changes > 0;
+    return this.db.prepare('INSERT OR IGNORE INTO event_log (event_id, name, chat_id, message_id, from_me, occurred_at, data) VALUES (?, ?, ?, ?, ?, ?, ?)')
+      .run(event.eventId, event.name ?? DEFAULT_EVENT_NAME, event.chatId, event.messageId, event.fromMe ? 1 : 0, event.occurredAt, event.data ?? null).changes > 0;
   }
 
   nextEvent(after: number): StoredEvent | undefined {
     this.assertOpen();
     const row = this.db.prepare('SELECT * FROM event_log WHERE seq > ? ORDER BY seq LIMIT 1').get(after) as EventRow | undefined;
     return row ? {
-      seq: row.seq, eventId: row.event_id, chatId: row.chat_id, messageId: row.message_id,
-      fromMe: row.from_me === 1, occurredAt: row.occurred_at,
+      seq: row.seq, eventId: row.event_id, name: row.name ?? DEFAULT_EVENT_NAME, chatId: row.chat_id, messageId: row.message_id,
+      fromMe: row.from_me === 1, occurredAt: row.occurred_at, data: row.data,
     } : undefined;
   }
 

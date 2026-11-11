@@ -23,6 +23,7 @@ With this MCP server, you can:
 - **Selectable WhatsApp Backend**: Uses [whatsapp-web.js](https://github.com/pedroslopez/whatsapp-web.js) by default, with an optional [Baileys](https://github.com/WhiskeySockets/Baileys) backend that runs without a browser
 - **MCP Server**: Implements the [Model Context Protocol](https://modelcontextprotocol.io/) for seamless integration with AI assistants
 - **Media Support**: Send and receive images, videos, documents, and audio messages
+- **Webhooks** (Baileys): signed notifications for new messages and for incoming calls, including who is calling
 - **Multiple Transport Options**: Supports stdio and Streamable HTTP transports — even both at once from a single process (start with stdio and set `MCP_HTTP_PORT` to additionally expose `http://127.0.0.1:<port>/mcp`, or run HTTP-only with `--http`)
 - **Flexible Authentication**: QR code (as an MCP image tool), pairing code (`request_pairing_code` tool, or automatically printed to stderr at startup via `WHATSAPP_PAIRING_PHONE_NUMBER`), and an optional OAuth flow for HTTP clients (`MCP_OAUTH=true`) where the browser authorization page shows the WhatsApp QR code — unlinking WhatsApp revokes tokens so clients automatically re-authenticate
 
@@ -159,7 +160,36 @@ Anything else can be configured directly:
 WHATSAPP_WEBHOOK_URL=http://127.0.0.1:5678/webhook/whatsapp
 WHATSAPP_WEBHOOK_SECRET=whsec_<base64 of 24 to 64 random bytes>
 WHATSAPP_WEBHOOK_CHAT_IDS=120363000000000000@g.us
+# Optional. Which events this receiver gets; the default is message.received only.
+WHATSAPP_WEBHOOK_EVENTS=message.received,call.received,call.ended
 ```
+
+### Call events (webhooks)
+
+The Baileys backend can also tell a receiver when someone calls, for example to show a "who is calling" window. There are two events:
+
+- `call.received`: a voice or video call is ringing right now.
+- `call.ended`: that call stopped ringing. `reason` says how: `missed` (nobody answered), `rejected` (declined on one of your devices or with `reject_call`), `answered_elsewhere` (picked up on another device) or `ended` (the caller hung up, or the server lost track of the call for three minutes).
+
+A ringing popup is only useful while the phone rings, so calls are treated differently from messages:
+
+- Only live calls count. A call that came in while the server was offline, or that is already more than a minute old when it arrives, never produces `call.received`.
+- A `call.received` that cannot be delivered within a minute of the call (receiver down, retries still waiting) is dropped instead of delivered late. The matching `call.ended` is still delivered, with the usual retries, so the receiver always learns how the call ended. A receiver should simply ignore a `call.ended` for a call it never saw.
+- `call.ended` is only sent for calls that were announced as ringing.
+
+Deliveries use the same envelope, signing, retries and cursor as messages:
+
+```json
+{ "eventId": "evt_…", "name": "call.received", "timestamp": "2026-11-10T21:04:05.000Z", "cursor": "42",
+  "data": { "callId": "…", "chatId": "4915550001@s.whatsapp.net", "from": "4915550001@s.whatsapp.net",
+            "isVideo": false, "isGroup": false, "status": "ringing",
+            "contact": { "id": "4915550001@s.whatsapp.net", "name": "Alice", "pushname": "Ali",
+                         "number": "4915550001", "isMyContact": true } } }
+```
+
+`call.ended` has the same `data`, with `reason` in place of `status`. In `contact`, `name` is the name saved in your address book (or `null`), `pushname` is the name the caller chose in WhatsApp (or empty) and `number` is the phone number. If the caller cannot be looked up, the call is still announced with `name: null` and the number taken from the caller's id. Callers who only show up with a private WhatsApp id are matched to their number when WhatsApp sends it along; otherwise `number` is empty. For a group call, `chatId` is the group.
+
+To receive calls, subscribe to `call.received` and `call.ended` with `events/subscribe` (one subscription per event name; `chat_ids` limits them to certain chats or callers, `include_own` does not apply), or add them to `WHATSAPP_WEBHOOK_EVENTS` for the configured receiver.
 
 ### Installation with FLUJO
 
@@ -313,6 +343,9 @@ This is particularly useful when:
 - `send_file`- Send a file (image, video, document) to a chat
 - `send_audio_message`- Send an audio message (voice note)
 - `download_media`- Download media from a message
+
+### Calls
+- `reject_call`- Decline a call that is ringing right now, by the `callId` from a `call.received` event (Baileys backend only; fails once the call stopped ringing)
 
 ## Browser Process Management
 
