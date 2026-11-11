@@ -12,6 +12,8 @@ import makeWASocket, {
   type Contact,
   type GroupMetadata,
   type UserFacingSocketConfig,
+  type WACallEvent,
+  type WACallUpdateType,
   type WAMessage,
   type WAMessageKey,
   type WASocket,
@@ -21,7 +23,9 @@ import { readFile, stat } from 'node:fs/promises';
 import path from 'node:path';
 import { fileTypeFromBuffer } from 'file-type';
 import { BaileysStore } from './baileys-store.js';
-import { MessageEvents, type MessageEventDeps } from './events.js';
+import {
+  CALL_FRESH_MS, MessageEvents, type CallContact, type CallDetails, type CallEndReason, type MessageEventDeps,
+} from './events.js';
 import { transcriberFor } from './transcriber.js';
 import type {
   BackendStatus, MediaData, SentMessage, SimpleChat, SimpleContact, SimpleMessage, WhatsAppBackend,
@@ -30,7 +34,7 @@ import { log } from '../utils/logger.js';
 
 export type BaileysSocket = Pick<WASocket,
   'ev' | 'end' | 'logout' | 'requestPairingCode' | 'sendMessage' |
-  'fetchMessageHistory' | 'updateMediaMessage' | 'groupMetadata' | 'user'>;
+  'fetchMessageHistory' | 'updateMediaMessage' | 'groupMetadata' | 'user' | 'rejectCall'>;
 
 /** Socket injection keeps tests offline; no browser or live connection is needed. */
 export interface BaileysServiceDeps {
@@ -63,6 +67,34 @@ export function linkedDeviceBrowser(app = process.env.BAILEYS_BROWSER?.trim() ||
 async function fetchCurrentWaWebVersion(): Promise<WAVersion | undefined> {
   const { version, isLatest } = await fetchLatestWaWebVersion({ signal: AbortSignal.timeout(10_000) });
   return isLatest ? version : undefined;
+}
+
+/** How a call stopped ringing, by the status WhatsApp reports. */
+const CALL_END_REASONS: Partial<Record<WACallUpdateType, CallEndReason>> = {
+  timeout: 'missed', reject: 'rejected', accept: 'answered_elsewhere', terminate: 'ended',
+};
+/** Forget a ringing call that never reported an end, e.g. across a lost connection. */
+const CALL_RING_LIMIT_MS = 3 * 60_000;
+
+interface RingingCall {
+  details: CallDetails;
+  /** The caller id exactly as WhatsApp sent it; a rejection must be addressed to it. */
+  creator: string;
+  timer: ReturnType<typeof setTimeout>;
+}
+
+function phoneNumberJid(value: string | undefined): string | undefined {
+  if (!value) return undefined;
+  if (value.includes('@')) {
+    const jid = jidNormalizedUser(value);
+    return jid?.endsWith('@s.whatsapp.net') ? jid : undefined;
+  }
+  const digits = value.replace(/\D/g, '');
+  return digits ? `${digits}@s.whatsapp.net` : undefined;
+}
+
+function numberOf(jid: string | undefined): string {
+  return jid?.endsWith('@s.whatsapp.net') ? jid.split('@')[0]! : '';
 }
 
 const MAX_RECONNECT_ATTEMPTS = 8;
@@ -149,6 +181,7 @@ export class BaileysService implements WhatsAppBackend {
   private waVersion?: WAVersion;
   private readonly historyRequests = new Map<string, number>();
   private readonly historyInflight = new Map<string, Promise<void>>();
+  private readonly ringingCalls = new Map<string, RingingCall>();
 
   constructor(deps: BaileysServiceDeps = {}) {
     this.deps = deps;
@@ -364,6 +397,91 @@ export class BaileysService implements WhatsAppBackend {
     on('groups.upsert', updateGroups);
     on('groups.update', updateGroups);
     on('group-participants.update', update => { this.groupCache.delete(update.id); });
+    on('call', calls => this.handleCalls(calls));
+  }
+
+  /** Never throws: a failing call event must not stop the connection. */
+  private handleCalls(calls: WACallEvent[]): void {
+    for (const call of calls ?? []) {
+      try { this.handleCall(call); } catch (error) { log.error('Could not handle a WhatsApp call event:', error); }
+    }
+  }
+
+  private handleCall(call: WACallEvent): void {
+    if (!call?.id) return;
+    const time = call.date instanceof Date ? call.date.getTime() : Number.NaN;
+    const at = Number.isFinite(time) ? time : Date.now();
+    if (call.status === 'offer') {
+      // Only a call that is ringing right now: never one replayed after being offline.
+      if (call.offline || Date.now() - at > CALL_FRESH_MS || this.ringingCalls.has(call.id)) return;
+      const details = this.callDetails(call);
+      if (this.getSelfIds().includes(details.from)) return; // a call this account placed elsewhere
+      const timer = setTimeout(() => this.endCall(call.id, 'ended', Date.now()), CALL_RING_LIMIT_MS);
+      timer.unref?.();
+      this.ringingCalls.set(call.id, { details, creator: call.from || call.chatId, timer });
+      try { this.events?.recordCallReceived(details, at); } catch (error) { log.error('Could not record a call event:', error); }
+      return;
+    }
+    const reason = CALL_END_REASONS[call.status];
+    if (reason) this.endCall(call.id, reason, at);
+  }
+
+  private endCall(callId: string, reason: CallEndReason, at: number): void {
+    const ringing = this.ringingCalls.get(callId);
+    if (!ringing) return;
+    clearTimeout(ringing.timer);
+    this.ringingCalls.delete(callId);
+    try { this.events?.recordCallEnded(ringing.details, reason, at); } catch (error) { log.error('Could not record a call event:', error); }
+  }
+
+  private clearRingingCalls(): void {
+    for (const ringing of this.ringingCalls.values()) clearTimeout(ringing.timer);
+    this.ringingCalls.clear();
+  }
+
+  private safeJid(jid: string): string {
+    try { return this.normalizeJid(jid); } catch { return jidNormalizedUser(jid) || jid; }
+  }
+
+  private callDetails(call: WACallEvent): CallDetails {
+    const pn = phoneNumberJid(call.callerPn);
+    if (pn) {
+      // A caller known only by its private id (@lid) comes with its number; remember the pair.
+      for (const id of new Set([call.from, call.chatId])) {
+        if (!id?.endsWith('@lid')) continue;
+        try { this.requireStore().setLidMapping(id, pn); }
+        catch (error) { log.debug('Could not store the caller number mapping:', error); }
+      }
+    }
+    const from = this.safeJid(call.from || call.chatId);
+    const chatId = call.isGroup && call.groupJid ? this.safeJid(call.groupJid) : this.safeJid(call.chatId || call.from);
+    return { callId: call.id, chatId, from, isVideo: !!call.isVideo, isGroup: !!call.isGroup, contact: this.callContact(from, pn) };
+  }
+
+  /** The stored contact, as get_contact returns it; without one, what the ids alone tell. */
+  private callContact(id: string, pn: string | undefined): CallContact {
+    const number = numberOf(id) || numberOf(pn);
+    try {
+      const stored = this.requireStore().getContact(id);
+      if (stored) {
+        const contact = this.mapContact(stored);
+        return { id: contact.id, name: contact.name, pushname: contact.pushname, number: contact.number || number, isMyContact: contact.isMyContact };
+      }
+    } catch (error) {
+      log.warn('Could not look up the caller; announcing the call without a saved name:', error);
+    }
+    return { id, name: null, pushname: '', number, isMyContact: false };
+  }
+
+  /** Declines a call that is ringing on this account right now. */
+  async rejectCall(callId: string): Promise<void> {
+    const ringing = this.ringingCalls.get(callId);
+    if (!ringing) throw new Error(`Call ${callId} is not ringing (it already ended, or this server never saw it).`);
+    await this.ensureReady(5_000);
+    const socket = this.socket;
+    if (!socket || typeof socket.rejectCall !== 'function') throw new Error('This WhatsApp connection cannot decline calls.');
+    await socket.rejectCall(callId, ringing.creator);
+    this.endCall(callId, 'rejected', Date.now());
   }
 
   private startEvents(store: BaileysStore): void {
@@ -392,6 +510,7 @@ export class BaileysService implements WhatsAppBackend {
   }
 
   private stopEvents(): void {
+    this.clearRingingCalls();
     this.events?.stop();
     this.events = undefined;
   }

@@ -23,10 +23,11 @@ import { registerMessageTools } from './tools/messages.js';
 import { registerMediaTools } from './tools/media.js';
 import { registerAuthTools } from './tools/auth.js';
 import { registerEventHandlers, supportsEvents } from './tools/events.js';
+import { registerCallTools } from './tools/calls.js';
 
 const SERVER_INFO: Implementation = {
   name: 'mcp-whatsapp-web',
-  version: '1.2.0', // Keep in sync with package.json
+  version: '1.4.0', // Keep in sync with package.json
 };
 
 export type TransportType = 'stdio' | 'http';
@@ -64,6 +65,7 @@ export class WhatsAppMcpServer {
     registerChatTools(server, this.whatsapp);
     registerMessageTools(server, this.whatsapp);
     registerMediaTools(server, this.whatsapp);
+    registerCallTools(server, this.whatsapp);
     registerEventHandlers(server, this.whatsapp);
 
     server.tool('ping', async () => ({

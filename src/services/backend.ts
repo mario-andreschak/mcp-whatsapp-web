@@ -90,6 +90,8 @@ export interface WhatsAppBackend {
   saveVoiceTranscript?(messageId: string, text: string): void;
   /** React to a message; an empty emoji removes the reaction. */
   sendReaction?(messageId: string, emoji: string): Promise<void>;
+  /** Decline an incoming call that is ringing now. Baileys only for now. */
+  rejectCall?(callId: string): Promise<void>;
   getStatus(): BackendStatus;
   searchContacts(query: string): Promise<SimpleContact[]>;
   getContactById(contactId: string): Promise<SimpleContact | null>;
