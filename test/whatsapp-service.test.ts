@@ -2,6 +2,7 @@ import { describe, it, expect, vi, afterEach } from 'vitest';
 import { createRequire } from 'node:module';
 import path from 'node:path';
 import { makeService } from './helpers/fake-client.js';
+import { userDataRoot } from '../src/utils/data-paths.js';
 
 const { MessageMedia } = createRequire(import.meta.url)('whatsapp-web.js');
 
@@ -19,7 +20,8 @@ describe('browser configuration', () => {
     vi.stubEnv('WHATSAPP_NO_SANDBOX', '');
     const { fake } = makeService();
     const options = fake().options;
-    expect(options.authStrategy).toMatchObject({ dataPath: path.join(process.cwd(), 'whatsapp-sessions') });
+    // No setting and no old profile in the working directory: the fixed per-user place.
+    expect(options.authStrategy).toMatchObject({ dataPath: path.join(userDataRoot(), 'whatsapp-sessions') });
     expect(options.userAgent).toBe(false);
     expect(options.puppeteer?.headless).toBe(true);
     expect(options.puppeteer?.ignoreDefaultArgs).toEqual(['--enable-automation']);

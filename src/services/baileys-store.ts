@@ -1,7 +1,7 @@
 import Database from 'better-sqlite3';
 import { chmodSync, mkdirSync } from 'node:fs';
 import { hostname } from 'node:os';
-import { join, resolve } from 'node:path';
+import { dirname, join, resolve } from 'node:path';
 import { randomUUID } from 'node:crypto';
 import {
   BufferJSON,
@@ -112,9 +112,20 @@ function definedFields<T extends object>(value: T): T {
   return Object.fromEntries(Object.entries(value).filter(([, field]) => field !== undefined)) as T;
 }
 
+/** Another running program owns this sign-in folder. */
+export class SessionInUseError extends Error {
+  constructor(readonly directory: string, readonly pid: number, readonly host: string) {
+    super(`This WhatsApp sign-in (${directory}) is already in use by another program (process ${pid} on ${host}). `
+      + 'Two programs cannot share one sign-in. Close the other program, or give this one its own folder with '
+      + 'BAILEYS_SESSION_DIR and link it as its own device (WhatsApp allows several linked devices).');
+    this.name = 'SessionInUseError';
+  }
+}
+
 /** Durable auth and synchronized history. One live process owns a session database. */
 export class BaileysStore {
   readonly databasePath: string;
+  readonly directory: string;
   private readonly db: Database.Database;
   private readonly ownerToken = randomUUID();
   private closed = false;
@@ -123,6 +134,7 @@ export class BaileysStore {
 
   constructor(sessionDir: string) {
     const directory = resolve(sessionDir);
+    this.directory = directory;
     mkdirSync(directory, { recursive: true, mode: 0o700 });
     this.databasePath = join(directory, 'session.sqlite');
     this.db = new Database(this.databasePath, { timeout: 10_000 });
@@ -197,9 +209,7 @@ export class BaileysStore {
             definitelyDead = (error as NodeJS.ErrnoException).code === 'ESRCH';
           }
         }
-        if (!definitelyDead) {
-          throw new Error(`Baileys session is already in use by process ${owner.pid} on ${owner.host}. Stop that server or select another BAILEYS_SESSION_DIR.`);
-        }
+        if (!definitelyDead) throw new SessionInUseError(this.directory, owner.pid, owner.host);
       }
       this.db.prepare('INSERT OR REPLACE INTO session_owner (singleton, pid, host, token) VALUES (1, ?, ?, ?)')
         .run(process.pid, hostname(), this.ownerToken);
@@ -628,6 +638,27 @@ export class BaileysStore {
     this.assertOpen();
     this.authGeneration++;
     this.auth = undefined;
+  }
+
+  /** True when the stored credentials belong to a linked WhatsApp account. */
+  hasLinkedAccount(): boolean {
+    this.assertOpen();
+    const row = this.db.prepare('SELECT data FROM credentials WHERE singleton = 1').get() as JsonRow | undefined;
+    if (!row) return false;
+    try {
+      const creds = deserialize<Partial<AuthenticationCreds>>(row.data);
+      return !!creds.me?.id || !!creds.registered;
+    } catch {
+      return false;
+    }
+  }
+
+  /** Writes a consistent copy of the whole database (sign-in and history) to a new file. */
+  backupTo(file: string): void {
+    this.assertOpen();
+    mkdirSync(dirname(file), { recursive: true, mode: 0o700 });
+    this.db.exec(`VACUUM INTO '${file.replace(/'/g, "''")}'`);
+    try { chmodSync(file, 0o600); } catch { /* best effort on systems without POSIX modes */ }
   }
 
   /** Explicit logout erases credentials and all account history; reconnects must use close(). */

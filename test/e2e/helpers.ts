@@ -17,7 +17,14 @@ export interface ServerHandle {
 export function spawnServer(args: string[] = [], env: Record<string, string> = {}): ServerHandle {
   const proc = spawn('node', ['dist/index.js', ...args], {
     cwd: PROJECT_ROOT,
-    env: { ...process.env, ...env },
+    // Keep e2e sign-ins inside this checkout (killOwnTestBrowsers relies on it), never in the
+    // standard per-user folder that a real installation uses.
+    env: {
+      ...process.env,
+      WHATSAPP_SESSION_DIR: path.join(PROJECT_ROOT, 'whatsapp-sessions'),
+      BAILEYS_SESSION_DIR: path.join(PROJECT_ROOT, 'baileys-sessions'),
+      ...env,
+    },
     stdio: ['pipe', 'pipe', 'pipe'],
   });
 

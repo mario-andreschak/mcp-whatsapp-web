@@ -15,13 +15,13 @@
       "sizes": ["391x389"]
     }
   ],
-  "version": "1.4.0",
+  "version": "1.4.1",
   "packages": [
     {
       "registryType": "npm",
       "registryBaseUrl": "https://registry.npmjs.org",
       "identifier": "mcp-whatsapp-web",
-      "version": "1.4.0",
+      "version": "1.4.1",
       "runtimeHint": "npx",
       "transport": {
         "type": "stdio"
@@ -37,7 +37,7 @@
         },
         {
           "name": "BAILEYS_SESSION_DIR",
-          "description": "Baileys credentials and synchronized history directory (default: <working directory>/baileys-sessions). Use a private absolute path, owned by one server process.",
+          "description": "Baileys sign-in and synchronized history folder (default: a fixed per-user place, e.g. %LOCALAPPDATA%\\mcp-whatsapp-web\\baileys-sessions on Windows; an existing <working directory>/baileys-sessions keeps being used). One running server owns a folder; give a second program its own folder.",
           "isRequired": false,
           "format": "filepath"
         },
@@ -78,7 +78,7 @@
         },
         {
           "name": "WHATSAPP_SESSION_DIR",
-          "description": "webjs only: persistent browser profile directory (default: <working directory>/whatsapp-sessions)",
+          "description": "webjs only: persistent browser profile folder (default: a fixed per-user place, e.g. %LOCALAPPDATA%\\mcp-whatsapp-web\\whatsapp-sessions on Windows; an existing <working directory>/whatsapp-sessions keeps being used)",
           "isRequired": false,
           "format": "filepath"
         },

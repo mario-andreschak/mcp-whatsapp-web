@@ -128,6 +128,16 @@ describe('get_qr_code', () => {
     expect(text(result)).toMatch(/already authenticated/i);
   });
 
+  it('waits briefly for a fresh QR code when none is showing right now', async () => {
+    fakeService.isAuthenticated.mockReturnValue(false);
+    fakeService.waitForAuthOutcome.mockImplementation(async () => {
+      fakeService.getLatestQrCode.mockReturnValue('1@fresh,code,2');
+    });
+    const result = await client.callTool({ name: 'get_qr_code', arguments: {} });
+    expect(fakeService.waitForAuthOutcome).toHaveBeenCalledWith(10_000);
+    expect((result as { content: Array<{ type: string }> }).content[0].type).toBe('image');
+  });
+
   it('asks for patience when no QR is available yet', async () => {
     fakeService.isAuthenticated.mockReturnValue(false);
     const result = await client.callTool({ name: 'get_qr_code', arguments: {} });

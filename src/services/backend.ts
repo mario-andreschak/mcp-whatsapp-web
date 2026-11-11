@@ -54,9 +54,30 @@ export interface MediaData {
   filesize?: number | null;
 }
 
+export type ConnectionState =
+  | 'connecting' | 'linked' | 'waiting_for_link' | 'reconnecting' | 'waiting_for_other_program' | 'stopped';
+
+/** What the link to WhatsApp is doing right now, in plain words. */
+export interface ConnectionStatus {
+  state: ConnectionState;
+  /** One or two plain sentences for people. */
+  summary: string;
+  /** When the current state began (ISO time), e.g. since when it has been reconnecting. */
+  since?: string;
+  /** Why the connection last dropped, in plain words. */
+  lastReason?: string;
+  /** Reconnect attempts since the connection was last working. */
+  attempts?: number;
+  /** When the next reconnect attempt is due (ISO time). */
+  nextAttemptAt?: string;
+  /** Where this server keeps its sign-in. */
+  signInFolder?: string;
+}
+
 export interface BackendStatus {
   backend: 'webjs' | 'baileys';
   authenticated: boolean;
+  connection?: ConnectionStatus;
   history: {
     state: 'unavailable' | 'syncing' | 'available';
     messageCount?: number;
@@ -69,6 +90,8 @@ export interface BackendStatus {
 
 export interface WhatsAppBackend {
   readonly backend: 'webjs' | 'baileys';
+  /** The folder holding this backend's sign-in. */
+  readonly sessionDir?: string;
   initialize(): Promise<void>;
   destroy(): Promise<void>;
   logout(): Promise<void>;

@@ -80,7 +80,7 @@ FFmpeg is bundled automatically via the `ffmpeg-static` npm package — no manua
    cp .env.example .env
    ```
 
-   You can select the backend with `WHATSAPP_BACKEND`, adjust logging levels, pin the WhatsApp Web version, or override the auto-detected browser (`BROWSER_EXECUTABLE_PATH`) and ffmpeg binary (`FFMPEG_PATH`). `WHATSAPP_HEADLESS=false` shows the web.js browser window, and `WHATSAPP_SESSION_DIR` relocates its persistent profile. Use an absolute session directory to keep it consistent across working directories.
+   You can select the backend with `WHATSAPP_BACKEND`, adjust logging levels, pin the WhatsApp Web version, or override the auto-detected browser (`BROWSER_EXECUTABLE_PATH`) and ffmpeg binary (`FFMPEG_PATH`). `WHATSAPP_HEADLESS=false` shows the web.js browser window, and `WHATSAPP_SESSION_DIR` relocates its persistent profile. Without these settings the sign-in is kept in a fixed place for your user account, so it no longer matters which folder a program starts the server from (see [Keeping the link](#keeping-the-link)).
 
 ### Choosing a backend
 
@@ -90,10 +90,11 @@ To use the optional Baileys backend, set these variables in your MCP client conf
 
 ```dotenv
 WHATSAPP_BACKEND=baileys
-BAILEYS_SESSION_DIR=C:/path/to/your/baileys-sessions
+# Optional: where the sign-in lives. Leave it out to use the standard place.
+#BAILEYS_SESSION_DIR=C:/path/to/your/baileys-sessions
 ```
 
-`BAILEYS_SESSION_DIR` defaults to `<working directory>/baileys-sessions`; the example above should be replaced with your own absolute directory. Pair this backend separately with `get_qr_code` or `request_pairing_code`. The existing `WHATSAPP_PAIRING_PHONE_NUMBER` option also works. Baileys cannot reuse the web.js browser profile. You can switch back to `webjs` and resume its existing session.
+`BAILEYS_SESSION_DIR` is optional; without it the sign-in lives in the standard place described in [Keeping the link](#keeping-the-link). Pair this backend separately with `get_qr_code` or `request_pairing_code`. The existing `WHATSAPP_PAIRING_PHONE_NUMBER` option also works. Baileys cannot reuse the web.js browser profile. You can switch back to `webjs` and resume its existing session.
 
 Baileys links as a Chrome device (shown as "Chrome (Windows)" or "Chrome (Mac OS)" under Linked devices). WhatsApp currently ends new links that claim to be the Desktop app with status 428 ("Connection Terminated") before a QR code appears. Desktop would request the full chat history; Chrome receives recent history, and live messages are stored from then on. `BAILEYS_BROWSER=Desktop` restores the old behaviour. At startup the backend also looks up the current WhatsApp Web version from `web.whatsapp.com`, because WhatsApp refuses clients that report an outdated one; `WA_WEB_VERSION` pins it, and a failed lookup falls back to the version bundled with Baileys.
 
@@ -109,14 +110,46 @@ On macOS/Linux, the equivalent installation command is `PUPPETEER_SKIP_DOWNLOAD=
 
 ### Baileys sessions and history
 
-- Credentials, Signal keys, contacts, chats and messages persist in `BAILEYS_SESSION_DIR/session.sqlite`. Keep the whole directory private and out of version control. Only one running server may own a session directory. Use separate directories for independent accounts.
-- Normal shutdown preserves the session. Explicit logout or invalid authentication clears the Baileys credentials and cached account data, and revokes its OAuth access tokens. Baileys HTTP OAuth state is stored separately from web.js in `BAILEYS_SESSION_DIR/oauth-store.json`.
+- Credentials, Signal keys, contacts, chats and messages persist in `session.sqlite` inside the sign-in folder. Keep the whole folder private and out of version control. Only one running server may own a sign-in folder. Use separate folders for independent accounts.
+- Normal shutdown and lost connections keep the sign-in. Only a clear "this device was removed" from WhatsApp, or the `logout` tool, ends it; both revoke the OAuth access tokens. Baileys HTTP OAuth state is stored separately from web.js in `oauth-store.json` inside the sign-in folder.
 - `get_backend_status` reports the active backend, authentication, stored record counts and history synchronization state. Being connected does not mean history has finished arriving. An `available` history state means local data is available, not that WhatsApp supplied a complete archive.
 - Contact and history tools query the local synchronized store. Initial full-history sync is requested and can take time on large accounts. `list_messages` may request up to 100 additional older messages when a known chat has fewer than requested, with a bounded wait and a per-chat cooldown. Late history batches are persisted for subsequent queries. WhatsApp may still supply only part of an account's history.
 - Treat returned message IDs as opaque and use IDs from the active backend. Legacy `@c.us` phone-number inputs, `@s.whatsapp.net`, groups and `@lid` identifiers are supported; known LID/phone mappings are persisted. Message IDs from web.js cannot be passed to Baileys or vice versa.
 - Text, media, downloads, voice notes and the existing authentication tools use the same MCP interface. Voice-note inputs must be local files or base64; FFmpeg converts them to mono Opus/Ogg before sending. If conversion fails, the tool reports an error without sending a different message type.
 
 The Baileys backend is opt-in and pinned to `7.0.0-rc14`. Review upstream changes before upgrading, especially authentication and message-format migrations. See the [Baileys documentation](https://baileys.wiki/) and [release history](https://github.com/WhiskeySockets/Baileys/releases).
+
+### Keeping the link
+
+You should only need to scan the QR code once. After that the server stays linked, even when it is restarted, started by a different program, or loses its internet connection for a while.
+
+**Where the sign-in lives.** By default the sign-in is kept in one fixed place for your user account, whatever folder a program starts the server from:
+
+| System | Baileys | web.js |
+| --- | --- | --- |
+| Windows | `%LOCALAPPDATA%\mcp-whatsapp-web\baileys-sessions` | `%LOCALAPPDATA%\mcp-whatsapp-web\whatsapp-sessions` |
+| macOS | `~/Library/Application Support/mcp-whatsapp-web/baileys-sessions` | `~/Library/Application Support/mcp-whatsapp-web/whatsapp-sessions` |
+| Linux | `~/.local/share/mcp-whatsapp-web/baileys-sessions` (or under `$XDG_DATA_HOME`) | `~/.local/share/mcp-whatsapp-web/whatsapp-sessions` |
+
+- If you set `BAILEYS_SESSION_DIR` (or `WHATSAPP_SESSION_DIR` for web.js), that folder is always used.
+- Older versions kept the sign-in in a `baileys-sessions` (or `whatsapp-sessions`) folder inside the folder the server was started from. If such a sign-in exists and no folder is set, the server keeps using it and says so in its log.
+- At start the log says which folder is used and whether it holds a sign-in. `get_backend_status` shows it too, as `connection.signInFolder`.
+
+**Moving the sign-in.** Stop every program that runs the server, move the whole folder (all files in it) to the new place, then either put it in the standard place above or point `BAILEYS_SESSION_DIR` at it, and start the server again.
+
+**Using it from more than one program.** Two programs cannot share one sign-in at the same time. The second one waits and takes over by itself when the first one closes. If both should run at the same time, give the second program its own folder (`BAILEYS_SESSION_DIR`) and link it as its own device by scanning a new QR code. WhatsApp allows several linked devices per phone. Never copy a sign-in folder to a second program: the two copies would keep pushing each other off.
+
+**When the connection drops.** The server reconnects by itself: quickly at first, then every five minutes for as long as it runs, so it recovers on its own when the network comes back. Asking for WhatsApp (for example `check_auth_status` or any tool) makes it try again at once. `get_backend_status` tells you in plain words what is going on: `connection.state` is `linked`, `reconnecting`, `waiting_for_link`, `waiting_for_other_program` or `stopped`, with `since`, `lastReason` and the next attempt.
+
+**What really ends a link.** Only these need a new QR code:
+
+- The device was removed under Settings > Linked devices on the phone, or with the `logout` tool.
+- The phone was offline for a long time (WhatsApp ends linked devices after about 14 days without the phone).
+- WhatsApp itself ends the link, for example for an account problem.
+
+Short network problems, restarts, stray errors from WhatsApp and a full disk do not end the link; the server keeps the sign-in and tries again.
+
+**Backups of discarded sign-ins.** When WhatsApp clearly says the device was removed, the old sign-in is not deleted. It is set aside as a dated copy in the `backups` folder inside the sign-in folder (the newest three are kept), and the log says why. If that was a mistake, stop the server, move the current `session.sqlite` (and its `-wal` and `-shm` files) out of the way and copy the backup back as `session.sqlite`. The `logout` tool is different: it is your explicit choice and erases the sign-in without a backup.
 
 ### Voice notes
 
@@ -301,7 +334,7 @@ The first time you run the server, you'll need to authenticate with WhatsApp:
    - Go to Settings > Linked Devices > Link a Device
    - Point your phone camera at the QR code displayed
 
-Your session will be saved locally in the `whatsapp-sessions` directory and will be reused automatically on subsequent runs. If you don't authenticate using the QR code, you won't be able to use any WhatsApp functionality.
+Your session is saved in the sign-in folder (see [Keeping the link](#keeping-the-link)) and reused automatically on later runs. If you don't authenticate using the QR code, you won't be able to use any WhatsApp functionality.
 
 ### Authentication Status and Logout
 
