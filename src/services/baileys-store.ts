@@ -27,6 +27,36 @@ interface MessageRow extends JsonRow {
   timestamp: number;
 }
 
+export interface StoredEventSubscription {
+  id: string;
+  url: string;
+  secret: string;
+  chatIds: string[] | null;
+  includeOwn: boolean;
+  cursor: number;
+  expiresAt: number | null;
+  active: boolean;
+  createdAt: number;
+}
+
+export interface StoredEvent {
+  seq: number;
+  eventId: string;
+  chatId: string;
+  messageId: string;
+  fromMe: boolean;
+  occurredAt: number;
+}
+
+interface EventSubscriptionRow {
+  id: string; url: string; secret: string; chat_ids: string | null; include_own: number;
+  cursor: number; expires_at: number | null; active: number; created_at: number;
+}
+
+interface EventRow {
+  seq: number; event_id: string; chat_id: string; message_id: string; from_me: number; occurred_at: number;
+}
+
 export interface StoredAuthState {
   state: AuthenticationState;
   saveCreds(update?: Partial<AuthenticationCreds>): Promise<void>;
@@ -114,6 +144,14 @@ export class BaileysStore {
           chat_id TEXT NOT NULL, message_id TEXT NOT NULL, from_me INTEGER NOT NULL,
           participant TEXT NOT NULL, text TEXT NOT NULL, created_at INTEGER NOT NULL,
           PRIMARY KEY (chat_id, message_id, from_me, participant)
+        );
+        CREATE TABLE IF NOT EXISTS event_log (
+          seq INTEGER PRIMARY KEY AUTOINCREMENT, event_id TEXT NOT NULL UNIQUE, chat_id TEXT NOT NULL,
+          message_id TEXT NOT NULL, from_me INTEGER NOT NULL, occurred_at INTEGER NOT NULL
+        );
+        CREATE TABLE IF NOT EXISTS event_subscriptions (
+          id TEXT PRIMARY KEY, url TEXT NOT NULL, secret TEXT NOT NULL, chat_ids TEXT, include_own INTEGER NOT NULL,
+          cursor INTEGER NOT NULL, expires_at INTEGER, active INTEGER NOT NULL, created_at INTEGER NOT NULL
         );
         -- A transcript never outlives its voice note.
         CREATE TRIGGER IF NOT EXISTS transcripts_follow_messages AFTER DELETE ON messages BEGIN
@@ -482,6 +520,75 @@ export class BaileysStore {
       (SELECT COUNT(*) FROM contacts) AS contactCount`).get() as { messageCount: number; chatCount: number; contactCount: number };
   }
 
+  private mapEventSubscription(row: EventSubscriptionRow): StoredEventSubscription {
+    return {
+      id: row.id, url: row.url, secret: row.secret, chatIds: row.chat_ids === null ? null : JSON.parse(row.chat_ids) as string[],
+      includeOwn: row.include_own === 1, cursor: row.cursor, expiresAt: row.expires_at, active: row.active === 1, createdAt: row.created_at,
+    };
+  }
+
+  getEventSubscriptions(): StoredEventSubscription[] {
+    this.assertOpen();
+    return (this.db.prepare('SELECT * FROM event_subscriptions').all() as EventSubscriptionRow[]).map(row => this.mapEventSubscription(row));
+  }
+
+  getEventSubscription(id: string): StoredEventSubscription | undefined {
+    this.assertOpen();
+    const row = this.db.prepare('SELECT * FROM event_subscriptions WHERE id = ?').get(id) as EventSubscriptionRow | undefined;
+    return row ? this.mapEventSubscription(row) : undefined;
+  }
+
+  saveEventSubscription(sub: StoredEventSubscription): void {
+    this.assertOpen();
+    this.db.prepare(`INSERT OR REPLACE INTO event_subscriptions (id, url, secret, chat_ids, include_own, cursor, expires_at, active, created_at)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`).run(sub.id, sub.url, sub.secret, sub.chatIds === null ? null : JSON.stringify(sub.chatIds),
+      sub.includeOwn ? 1 : 0, sub.cursor, sub.expiresAt, sub.active ? 1 : 0, sub.createdAt);
+  }
+
+  deleteEventSubscription(id: string): void {
+    this.assertOpen();
+    this.db.prepare('DELETE FROM event_subscriptions WHERE id = ?').run(id);
+  }
+
+  setEventCursor(id: string, cursor: number): void {
+    this.assertOpen();
+    this.db.prepare('UPDATE event_subscriptions SET cursor = ? WHERE id = ?').run(cursor, id);
+  }
+
+  setEventSubscriptionActive(id: string, active: boolean): void {
+    this.assertOpen();
+    this.db.prepare('UPDATE event_subscriptions SET active = ? WHERE id = ?').run(active ? 1 : 0, id);
+  }
+
+  /** False when the event is already in the log. */
+  appendEvent(event: Omit<StoredEvent, 'seq'>): boolean {
+    this.assertOpen();
+    return this.db.prepare('INSERT OR IGNORE INTO event_log (event_id, chat_id, message_id, from_me, occurred_at) VALUES (?, ?, ?, ?, ?)')
+      .run(event.eventId, event.chatId, event.messageId, event.fromMe ? 1 : 0, event.occurredAt).changes > 0;
+  }
+
+  nextEvent(after: number): StoredEvent | undefined {
+    this.assertOpen();
+    const row = this.db.prepare('SELECT * FROM event_log WHERE seq > ? ORDER BY seq LIMIT 1').get(after) as EventRow | undefined;
+    return row ? {
+      seq: row.seq, eventId: row.event_id, chatId: row.chat_id, messageId: row.message_id,
+      fromMe: row.from_me === 1, occurredAt: row.occurred_at,
+    } : undefined;
+  }
+
+  latestEventSeq(): number {
+    this.assertOpen();
+    return (this.db.prepare('SELECT COALESCE(MAX(seq), 0) AS seq FROM event_log').get() as { seq: number }).seq;
+  }
+
+  /** Drops what every active subscription has received, and anything past the retention limit. */
+  pruneEvents(olderThan: number, now = Date.now()): void {
+    this.assertOpen();
+    this.db.prepare('DELETE FROM event_subscriptions WHERE expires_at IS NOT NULL AND expires_at <= ?').run(now);
+    const { cursor } = this.db.prepare('SELECT MIN(cursor) AS cursor FROM event_subscriptions WHERE active = 1').get() as { cursor: number | null };
+    this.db.prepare('DELETE FROM event_log WHERE occurred_at < ? OR seq <= ?').run(olderThan, cursor ?? Number.MAX_SAFE_INTEGER);
+  }
+
   getMeta<T = unknown>(key: string): T | undefined {
     this.assertOpen();
     const row = this.db.prepare('SELECT data FROM metadata WHERE key = ?').get(key) as JsonRow | undefined;
@@ -504,7 +611,7 @@ export class BaileysStore {
   /** Explicit logout erases credentials and all account history; reconnects must use close(). */
   clear(): void {
     this.transaction(() => {
-      for (const table of ['credentials', 'signal_keys', 'messages', 'transcripts', 'chats', 'contacts', 'jid_aliases', 'metadata']) {
+      for (const table of ['credentials', 'signal_keys', 'messages', 'transcripts', 'event_log', 'event_subscriptions', 'chats', 'contacts', 'jid_aliases', 'metadata']) {
         this.db.exec(`DELETE FROM ${table}`);
       }
     });

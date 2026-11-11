@@ -1,3 +1,4 @@
+import type { MessageEvents } from './events.js';
 /** Backend-neutral values exposed by the MCP tools. IDs are opaque to callers. */
 export interface SimpleContact {
   id: string;
@@ -80,6 +81,8 @@ export interface WhatsAppBackend {
   onSessionInvalidated(listener: () => void): void;
   /** New messages as they arrive; history sync does not trigger this. Baileys only for now. */
   onMessage?(listener: (message: SimpleMessage) => void): void;
+  /** Durable message events with webhook delivery. Baileys only for now. */
+  messageEvents?(): Promise<MessageEvents>;
   /** This account's identifiers, to recognise mentions of it. */
   getSelfIds?(): string[];
   /** Stored transcript of a voice note, for backends that persist them beside the history. */

@@ -30,6 +30,7 @@ export function registerMessageTools(
         // Return the simplified message structure
         return {
           content: [{ type: 'text', text: JSON.stringify(messages, null, 2) }],
+          structuredContent: { messages },
         };
       } catch (error: any) {
         log.error(`Error in list_messages tool for chat ${chat_id}:`, error);

@@ -22,6 +22,7 @@ import { registerChatTools } from './tools/chats.js';
 import { registerMessageTools } from './tools/messages.js';
 import { registerMediaTools } from './tools/media.js';
 import { registerAuthTools } from './tools/auth.js';
+import { registerEventHandlers, supportsEvents } from './tools/events.js';
 
 const SERVER_INFO: Implementation = {
   name: 'mcp-whatsapp-web',
@@ -53,6 +54,7 @@ export class WhatsAppMcpServer {
     const server = new McpServer(SERVER_INFO, {
       capabilities: {
         logging: {},
+        ...(supportsEvents(this.whatsapp) ? { experimental: { events: {} } } : {}),
       },
       instructions: 'This server provides tools to interact with WhatsApp.',
     });
@@ -62,6 +64,7 @@ export class WhatsAppMcpServer {
     registerChatTools(server, this.whatsapp);
     registerMessageTools(server, this.whatsapp);
     registerMediaTools(server, this.whatsapp);
+    registerEventHandlers(server, this.whatsapp);
 
     server.tool('ping', async () => ({
       content: [{ type: 'text', text: 'pong' }],

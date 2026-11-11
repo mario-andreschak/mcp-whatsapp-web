@@ -21,6 +21,8 @@ import { readFile, stat } from 'node:fs/promises';
 import path from 'node:path';
 import { fileTypeFromBuffer } from 'file-type';
 import { BaileysStore } from './baileys-store.js';
+import { MessageEvents, type MessageEventDeps } from './events.js';
+import { transcriberFor } from './transcriber.js';
 import type {
   BackendStatus, MediaData, SentMessage, SimpleChat, SimpleContact, SimpleMessage, WhatsAppBackend,
 } from './backend.js';
@@ -36,6 +38,7 @@ export interface BaileysServiceDeps {
   socketFactory?: (config: UserFacingSocketConfig) => BaileysSocket;
   downloadMedia?: typeof downloadMediaMessage;
   reconnectDelayMs?: number;
+  events?: MessageEventDeps;
   historyRequestTimeoutMs?: number;
   /** Current WhatsApp Web version; defaults to a lookup unless a socket factory is injected. */
   resolveVersion?: () => Promise<WAVersion | undefined>;
@@ -123,6 +126,7 @@ export class BaileysService implements WhatsAppBackend {
   private readonly deps: BaileysServiceDeps;
   private readonly sessionDir: string;
   private store?: BaileysStore;
+  private events?: MessageEvents;
   private socket?: BaileysSocket;
   private ready = false;
   private stopped = true;
@@ -170,9 +174,11 @@ export class BaileysService implements WhatsAppBackend {
       this.closeSocket();
       try {
         this.store ??= new BaileysStore(this.sessionDir);
+        this.startEvents(this.store);
         await this.openSocket(intent);
       } catch (error) {
         this.closeSocket();
+        this.stopEvents();
         this.store?.close();
         this.store = undefined;
         this.stopped = true;
@@ -315,6 +321,7 @@ export class BaileysService implements WhatsAppBackend {
         store.upsertMessages(data.messages);
         store.setMeta('history_synced_at', Date.now());
       });
+      this.recordEvents(data.messages, false);
       // isLatest identifies the first history notification; it does not mean sync is complete.
       if (data.syncType != null) {
         if (data.progress === 100) this.historySyncTypes.delete(data.syncType);
@@ -340,6 +347,7 @@ export class BaileysService implements WhatsAppBackend {
     on('chats.delete', chats => store.deleteChats(chats));
     on('messages.upsert', data => {
       store.upsertMessages(data.messages);
+      this.recordEvents(data.messages, data.type === 'notify');
       // Only live messages wake listeners; `append` carries history and offline catch-up.
       if (data.type === 'notify') for (const raw of data.messages) this.notifyMessage(raw);
     });
@@ -356,6 +364,47 @@ export class BaileysService implements WhatsAppBackend {
     on('groups.upsert', updateGroups);
     on('groups.update', updateGroups);
     on('group-participants.update', update => { this.groupCache.delete(update.id); });
+  }
+
+  private startEvents(store: BaileysStore): void {
+    this.events ??= new MessageEvents(store, {
+      normalizeChatId: id => this.normalizeJid(id),
+      getMessage: id => this.getMessageById(id),
+      ensureReady: timeoutMs => this.ensureReady(timeoutMs),
+      annotate: async message => {
+        const transcriber = transcriberFor(this);
+        const [annotated] = await transcriber.annotate([message], transcriber.configured);
+        return annotated;
+      },
+    }, this.deps.events);
+    this.events.start();
+  }
+
+  /** The store opens during initialize(), which can still be pending when a client subscribes. */
+  async messageEvents(): Promise<MessageEvents> {
+    const deadline = Date.now() + 30_000;
+    while (!this.events) {
+      if (this.terminalError) throw this.terminalError;
+      if (Date.now() >= deadline) throw new Error('WhatsApp storage is not available yet. Try again shortly.');
+      await new Promise(resolve => setTimeout(resolve, 100));
+    }
+    return this.events;
+  }
+
+  private stopEvents(): void {
+    this.events?.stop();
+    this.events = undefined;
+  }
+
+  /** A failure here must not stop persistence or live listeners. */
+  private recordEvents(raws: WAMessage[], live: boolean): void {
+    if (!this.events?.hasSubscriptions()) return;
+    try {
+      const messages = raws.filter(raw => raw.key?.remoteJid && raw.message).map(raw => this.mapMessage(raw));
+      this.events.record(messages, live);
+    } catch (error) {
+      log.error('Could not record message events:', error);
+    }
   }
 
   onMessage(listener: (message: SimpleMessage) => void): void {
@@ -399,6 +448,7 @@ export class BaileysService implements WhatsAppBackend {
     this.terminalError = new Error(reason);
     this.cancelReconnect();
     this.closeSocket();
+    this.stopEvents();
     try { this.store?.clear(); }
     catch (error) {
       log.error('Could not clear invalid Baileys credentials:', error);
@@ -466,6 +516,7 @@ export class BaileysService implements WhatsAppBackend {
     this.cancelReconnect();
     return this.enqueue(async () => {
       this.closeSocket();
+      this.stopEvents();
       this.store?.close();
       this.store = undefined;
     });
@@ -484,6 +535,7 @@ export class BaileysService implements WhatsAppBackend {
       } catch (error) { logoutError = error; }
       finally {
         this.closeSocket();
+        this.stopEvents();
         try {
           this.store ??= new BaileysStore(this.sessionDir);
           this.store.clear();
