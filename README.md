@@ -139,6 +139,28 @@ HF_HUB_OFFLINE=1
 
 Then `list_messages` with `transcribe_voice_notes: true` returns each voice note with a `transcript` field (or `transcriptError`), and `transcribe_voice_notes` transcribes given message IDs. Each voice note is transcribed once: the Baileys backend stores transcripts beside the chat history and deletes them with their message, on chat deletion and on logout; web.js keeps them for the life of the process. Only one transcription runs at a time. The first batch includes loading the model, so allow a few minutes (`WHATSAPP_TRANSCRIBE_TIMEOUT_MS`, default 15 minutes).
 
+### Message events (webhooks)
+
+With the Baileys backend, the server can post each new message to a URL as a signed webhook, instead of being asked for messages on a timer. Deliveries use [Standard Webhooks](https://www.standardwebhooks.com/) signing and the webhook part of the [MCP events draft](https://github.com/modelcontextprotocol/experimental-ext-triggers-events).
+
+Events are kept in the session database, so nothing is lost if either side is away:
+
+- A receiver that is down gets everything it missed, in order, once it answers again. Retries back off from 5 seconds up to an hour, and a repeat delivery keeps the same `webhook-id`.
+- Messages that arrive while this server is offline are delivered when WhatsApp hands them over on reconnect.
+- `503`, `425` and `429` mean "not now" and honour `Retry-After`. `410` ends the subscription.
+
+Voice notes carry a `transcript` when transcription is configured. Only messages newer than the subscription are delivered, and your own messages are skipped unless asked for.
+
+An MCP client such as FLUJO subscribes through the `events/list` and `events/subscribe` protocol methods. These are deliberately not tools, so a model cannot create a subscription. Subscriptions expire after 7 days unless refreshed. Receivers must be on this machine unless `WHATSAPP_EVENTS_ALLOW_REMOTE=1` is set, and then they must use https.
+
+Anything else can be configured directly:
+
+```dotenv
+WHATSAPP_WEBHOOK_URL=http://127.0.0.1:5678/webhook/whatsapp
+WHATSAPP_WEBHOOK_SECRET=whsec_<base64 of 24 to 64 random bytes>
+WHATSAPP_WEBHOOK_CHAT_IDS=120363000000000000@g.us
+```
+
 ### Installation with FLUJO
 
 [FLUJO](https://github.com/mario-andreschak/FLUJO/) provides a streamlined installation process:
