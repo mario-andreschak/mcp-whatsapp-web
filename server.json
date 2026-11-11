@@ -15,13 +15,13 @@
       "sizes": ["391x389"]
     }
   ],
-  "version": "1.4.1",
+  "version": "1.4.2",
   "packages": [
     {
       "registryType": "npm",
       "registryBaseUrl": "https://registry.npmjs.org",
       "identifier": "mcp-whatsapp-web",
-      "version": "1.4.1",
+      "version": "1.4.2",
       "runtimeHint": "npx",
       "transport": {
         "type": "stdio"

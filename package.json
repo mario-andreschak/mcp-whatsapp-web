@@ -1,6 +1,6 @@
 {
   "name": "mcp-whatsapp-web",
-  "version": "1.4.1",
+  "version": "1.4.2",
   "mcpName": "io.github.mario-andreschak/mcp-whatsapp-web",
   "description": "TypeScript MCP server for WhatsApp using whatsapp-web.js or browserless Baileys",
   "main": "dist/index.js",
