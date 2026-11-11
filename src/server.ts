@@ -15,6 +15,8 @@ import { createLinkRouter } from './auth/link-page.js';
 import type { WhatsAppBackend } from './services/backend.js';
 import { createWhatsAppBackend } from './services/backend-factory.js';
 import { log } from './utils/logger.js';
+import { packageVersion } from './utils/version.js';
+import { webjsOAuthStorePath } from './utils/data-paths.js';
 import { BrowserProcessManager } from './utils/browser-process-manager.js';
 // Import tool registration functions
 import { registerContactTools } from './tools/contacts.js';
@@ -27,8 +29,20 @@ import { registerCallTools } from './tools/calls.js';
 
 const SERVER_INFO: Implementation = {
   name: 'mcp-whatsapp-web',
-  version: '1.4.0', // Keep in sync with package.json
+  version: packageVersion(),
 };
+
+/**
+ * OAuth tokens belong to one WhatsApp sign-in, so they live beside it: in the Baileys sign-in
+ * folder, and for web.js in its sign-in folder unless an older store already sits in the
+ * working directory.
+ */
+export function oauthStorePath(whatsapp: Pick<WhatsAppBackend, 'backend' | 'sessionDir'>): string {
+  if (whatsapp.backend === 'baileys') {
+    return path.join(whatsapp.sessionDir ?? path.resolve(process.env.BAILEYS_SESSION_DIR || 'baileys-sessions'), 'oauth-store.json');
+  }
+  return whatsapp.sessionDir ? webjsOAuthStorePath(whatsapp.sessionDir) : path.join(process.cwd(), '.oauth-store.json');
+}
 
 export type TransportType = 'stdio' | 'http';
 
@@ -172,12 +186,7 @@ export class WhatsAppMcpServer {
     if (process.env.MCP_OAUTH === 'true') {
       const issuerUrl = new URL(`http://${host === '0.0.0.0' ? '127.0.0.1' : host}:${port}`);
       const mcpUrl = new URL('/mcp', issuerUrl);
-      const provider = new WhatsAppOAuthProvider(
-        this.whatsapp,
-        this.whatsapp.backend === 'baileys'
-          ? path.resolve(process.env.BAILEYS_SESSION_DIR || path.join(process.cwd(), 'baileys-sessions'), 'oauth-store.json')
-          : path.join(process.cwd(), '.oauth-store.json'),
-      );
+      const provider = new WhatsAppOAuthProvider(this.whatsapp, oauthStorePath(this.whatsapp));
       // Unlinking WhatsApp (logout / auth failure) revokes all tokens, so
       // clients get a 401 and automatically re-run the browser flow.
       this.whatsapp.onSessionInvalidated(() => provider.revokeAllTokens());

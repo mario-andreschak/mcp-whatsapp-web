@@ -19,18 +19,20 @@ import makeWASocket, {
   type WASocket,
   type WAVersion,
 } from '@whiskeysockets/baileys';
+import { readdirSync, rmSync } from 'node:fs';
 import { readFile, stat } from 'node:fs/promises';
 import path from 'node:path';
 import { fileTypeFromBuffer } from 'file-type';
-import { BaileysStore } from './baileys-store.js';
+import { BaileysStore, SessionInUseError } from './baileys-store.js';
 import {
   CALL_FRESH_MS, MessageEvents, type CallContact, type CallDetails, type CallEndReason, type MessageEventDeps,
 } from './events.js';
 import { transcriberFor } from './transcriber.js';
 import type {
-  BackendStatus, MediaData, SentMessage, SimpleChat, SimpleContact, SimpleMessage, WhatsAppBackend,
+  BackendStatus, ConnectionState, ConnectionStatus, MediaData, SentMessage, SimpleChat, SimpleContact, SimpleMessage, WhatsAppBackend,
 } from './backend.js';
 import { log } from '../utils/logger.js';
+import { baileysFolderHoldsSignIn, chooseSignInFolder } from '../utils/data-paths.js';
 
 export type BaileysSocket = Pick<WASocket,
   'ev' | 'end' | 'logout' | 'requestPairingCode' | 'sendMessage' |
@@ -41,7 +43,12 @@ export interface BaileysServiceDeps {
   sessionDir?: string;
   socketFactory?: (config: UserFacingSocketConfig) => BaileysSocket;
   downloadMedia?: typeof downloadMediaMessage;
+  /** First reconnect delay; it doubles with each quick attempt. */
   reconnectDelayMs?: number;
+  /** Pace of the endless slow attempts after the quick ones. */
+  slowReconnectDelayMs?: number;
+  /** How many dated backups of discarded sign-ins to keep. */
+  keepBackups?: number;
   events?: MessageEventDeps;
   historyRequestTimeoutMs?: number;
   /** Current WhatsApp Web version; defaults to a lookup unless a socket factory is injected. */
@@ -97,7 +104,84 @@ function numberOf(jid: string | undefined): string {
   return jid?.endsWith('@s.whatsapp.net') ? jid.split('@')[0]! : '';
 }
 
-const MAX_RECONNECT_ATTEMPTS = 8;
+/** Quick attempts (1s, 2s, 4s ... up to a minute apart) before settling into a slow, steady pace. */
+const QUICK_RECONNECT_ATTEMPTS = 8;
+const QUICK_RECONNECT_MAX_DELAY_MS = 60_000;
+/** After the quick attempts, keep trying this often for as long as the server runs. */
+const SLOW_RECONNECT_DELAY_MS = 5 * 60_000;
+/** Someone waiting for the link may pull a slow attempt forward, but not more often than this. */
+const MIN_ATTEMPT_SPACING_MS = 30_000;
+const SIGN_IN_BACKUPS_KEPT = 3;
+
+/** Delay before reconnect attempt number `attempt` (counting from 0). Never gives up. */
+export function reconnectDelay(attempt: number, firstDelayMs = 1_000, slowDelayMs = SLOW_RECONNECT_DELAY_MS): number {
+  const quick = Math.min(firstDelayMs * 2 ** Math.min(Math.max(attempt, 0), 30), QUICK_RECONNECT_MAX_DELAY_MS);
+  return attempt < QUICK_RECONNECT_ATTEMPTS ? quick : Math.max(quick, slowDelayMs);
+}
+
+export interface DisconnectDescription {
+  code?: number;
+  /** Why the connection ended, in plain words. */
+  reason: string;
+  /** WhatsApp clearly said this linked device was removed; the sign-in can no longer work. */
+  deviceRemoved: boolean;
+}
+
+/**
+ * Only a clear "this device was removed" from WhatsApp counts as signed out: status 401
+ * (logged out / unlinked on the phone) or a conflict of type device_removed. Everything
+ * else, including stray stream errors that Baileys reports as a bad session (500) and a
+ * refused account (403), keeps the sign-in.
+ */
+export function describeDisconnect(error: unknown): DisconnectDescription {
+  const value = error as { message?: unknown; output?: { statusCode?: unknown }; data?: unknown } | undefined;
+  const code = typeof value?.output?.statusCode === 'number' ? value.output.statusCode : undefined;
+  const data = value?.data as { tag?: unknown; attrs?: { type?: unknown } } | undefined;
+  const message = typeof value?.message === 'string' ? value.message : '';
+  const deviceRemoved = code === DisconnectReason.loggedOut || (data?.tag === 'conflict' && data.attrs?.type === 'device_removed');
+  const suffix = code !== undefined ? ` (code ${code})` : '';
+  let reason: string;
+  if (deviceRemoved) reason = 'WhatsApp removed this linked device: it was unlinked on the phone, or WhatsApp ended the link.';
+  else if (/QR refs attempts ended/i.test(message)) reason = 'The QR code expired before anyone scanned it.';
+  else if (code === DisconnectReason.restartRequired) reason = 'WhatsApp asked for a routine restart of the connection.';
+  else if (code === DisconnectReason.connectionClosed) reason = 'The connection was closed, often by a short network interruption.';
+  else if (code === DisconnectReason.timedOut) reason = 'The connection timed out: the network or WhatsApp did not answer in time.';
+  else if (code === DisconnectReason.connectionReplaced) reason = 'Another copy of this sign-in connected from somewhere else.';
+  else if (code === DisconnectReason.badSession) reason = 'WhatsApp sent an unexpected error message. The sign-in is kept.';
+  else if (code === DisconnectReason.unavailableService) reason = 'WhatsApp\'s service was temporarily unavailable.';
+  else if (code === DisconnectReason.forbidden) reason = 'WhatsApp refused the connection for this account. The sign-in is kept.';
+  else if (code === DisconnectReason.multideviceMismatch) reason = 'WhatsApp reported a linked-device mismatch.';
+  else reason = 'The connection dropped.';
+  return { ...(code !== undefined ? { code } : {}), reason: reason + suffix, deviceRemoved };
+}
+
+/**
+ * Sets a discarded sign-in aside as a dated copy in `<folder>/backups` instead of deleting it,
+ * keeping only the newest few. Returns the copy's path, or undefined when there was nothing to keep.
+ */
+export function backupSignIn(store: BaileysStore, sessionDir: string, keep = SIGN_IN_BACKUPS_KEPT, now = new Date()): string | undefined {
+  const counts = store.getCounts();
+  if (!store.hasLinkedAccount() && counts.messageCount + counts.chatCount + counts.contactCount === 0) return undefined;
+  const folder = path.join(sessionDir, 'backups');
+  const file = path.join(folder, `session-${now.toISOString().replace(/[:.]/g, '-')}.sqlite`);
+  store.backupTo(file);
+  pruneBackups(folder, keep);
+  return file;
+}
+
+function pruneBackups(folder: string, keep: number): void {
+  const backups = readdirSync(folder).filter(name => /^session-.+\.sqlite$/.test(name)).sort();
+  for (const name of backups.slice(0, Math.max(0, backups.length - Math.max(1, keep)))) {
+    try { rmSync(path.join(folder, name), { force: true }); }
+    catch (error) { log.warn(`Could not remove the old sign-in backup ${name}:`, error); }
+  }
+}
+
+function minutes(ms: number): string {
+  const value = Math.max(1, Math.round(ms / 60_000));
+  return value === 1 ? '1 minute' : `${value} minutes`;
+}
+
 const MAX_MEDIA_BYTES = 64 * 1024 * 1024;
 const HISTORY_NOTE = 'Only history delivered to this linked device and persisted locally is searchable; '
   + 'WhatsApp may supply an incomplete history. A chat query can request up to 100 older messages once per minute.';
@@ -153,12 +237,10 @@ function timeout<T>(promise: Promise<T>, ms: number, label: string): Promise<T> 
   });
 }
 
-const MAX_BAD_SESSION_CLOSES = 3;
-
 export class BaileysService implements WhatsAppBackend {
   readonly backend = 'baileys' as const;
   private readonly deps: BaileysServiceDeps;
-  private readonly sessionDir: string;
+  readonly sessionDir: string;
   private store?: BaileysStore;
   private events?: MessageEvents;
   private socket?: BaileysSocket;
@@ -173,8 +255,15 @@ export class BaileysService implements WhatsAppBackend {
   private pairingPromise?: Promise<string>;
   private reconnectTimer?: ReturnType<typeof setTimeout>;
   private reconnectAttempts = 0;
-  private badSessionCloses = 0;
+  private pendingReconnect?: () => void;
+  private nextAttemptAt?: number;
+  private lastAttemptAt = 0;
   private terminalError?: Error;
+  /** Set while another program holds this sign-in; cleared once this server owns it. */
+  private lockError?: SessionInUseError;
+  private connectionState: ConnectionState = 'connecting';
+  private stateSince = Date.now();
+  private lastReason?: string;
   private historySyncing = false;
   private readonly historySyncTypes = new Set<number>();
   private readonly groupCache = new Map<string, { value: GroupMetadata; expiresAt: number }>();
@@ -188,7 +277,42 @@ export class BaileysService implements WhatsAppBackend {
 
   constructor(deps: BaileysServiceDeps = {}) {
     this.deps = deps;
-    this.sessionDir = path.resolve(deps.sessionDir ?? process.env.BAILEYS_SESSION_DIR ?? path.join(process.cwd(), 'baileys-sessions'));
+    const folder = chooseSignInFolder({
+      configured: deps.sessionDir ?? process.env.BAILEYS_SESSION_DIR,
+      settingName: 'BAILEYS_SESSION_DIR',
+      folderName: 'baileys-sessions',
+      holdsSignIn: baileysFolderHoldsSignIn,
+    });
+    this.sessionDir = folder.dir;
+    log.info(folder.explanation);
+  }
+
+  private setState(state: ConnectionState): void {
+    if (state === this.connectionState) return;
+    this.connectionState = state;
+    this.stateSince = Date.now();
+  }
+
+  /** Opens the sign-in folder (once) and says in the log whether it holds a sign-in. */
+  private openStore(): BaileysStore {
+    if (this.store) return this.store;
+    const store = new BaileysStore(this.sessionDir);
+    this.store = store;
+    this.lockError = undefined;
+    log.info(store.hasLinkedAccount()
+      ? 'The sign-in folder holds a saved sign-in, so no QR code should be needed.'
+      : 'The sign-in folder holds no sign-in yet. Link this server with get_qr_code or request_pairing_code.');
+    return store;
+  }
+
+  /** Another program holds the sign-in: keep checking, and take over once it closes. */
+  private waitForOtherProgram(error: SessionInUseError, intent: number): void {
+    const first = !this.lockError;
+    this.lockError = error;
+    this.lastReason = 'Another program is using this sign-in.';
+    this.setState('waiting_for_other_program');
+    if (first) log.warn(`${error.message} This server keeps checking and takes over when the other program closes.`);
+    this.scheduleReconnect(intent, false);
   }
 
   private enqueue<T>(operation: () => Promise<T>): Promise<T> {
@@ -204,21 +328,30 @@ export class BaileysService implements WhatsAppBackend {
     const intent = ++this.intent;
     this.stopped = false;
     this.terminalError = undefined;
+    this.lockError = undefined;
+    this.lastReason = undefined;
     this.reconnectAttempts = 0;
+    this.setState('connecting');
+    this.stateSince = Date.now();
     const pending = this.enqueue(async () => {
       if (this.intent !== intent || this.stopped) return;
       this.closeSocket();
       try {
-        this.store ??= new BaileysStore(this.sessionDir);
-        this.startEvents(this.store);
+        const store = this.openStore();
+        this.startEvents(store);
         await this.openSocket(intent);
       } catch (error) {
         this.closeSocket();
         this.stopEvents();
+        if (error instanceof SessionInUseError && this.intent === intent && !this.stopped) {
+          this.waitForOtherProgram(error, intent);
+          throw error;
+        }
         this.store?.close();
         this.store = undefined;
         this.stopped = true;
         this.terminalError = error instanceof Error ? error : new Error(String(error));
+        this.setState('stopped');
         throw error;
       }
     });
@@ -308,6 +441,7 @@ export class BaileysService implements WhatsAppBackend {
       if (update.qr) {
         this.latestQr = update.qr;
         this.latestPairing = null;
+        this.setState('waiting_for_link');
         if (process.env.WHATSAPP_PAIRING_PHONE_NUMBER && !state.creds.registered) {
           void this.requestPairingCode(process.env.WHATSAPP_PAIRING_PHONE_NUMBER).then(code => {
             if (generation === this.generation && !this.stopped) {
@@ -326,30 +460,46 @@ export class BaileysService implements WhatsAppBackend {
         this.ready = true;
         this.latestQr = null;
         this.latestPairing = null;
+        if (this.connectionState === 'reconnecting') {
+          log.info(`Connected to WhatsApp again after ${minutes(Date.now() - this.stateSince)} away. The sign-in was kept.`);
+        } else {
+          log.info('Connected to WhatsApp.');
+        }
         this.reconnectAttempts = 0;
-        this.badSessionCloses = 0;
         this.terminalError = undefined;
+        this.setState('linked');
         this.historySyncing = !store.getMeta<number>('history_synced_at');
       }
       if (update.connection === 'close') {
         this.ready = false;
         this.latestQr = null;
         this.latestPairing = null;
-        const error = update.lastDisconnect?.error;
-        const code = (error as { output?: { statusCode?: number } } | undefined)?.output?.statusCode;
-        // Baileys reports every stream error it has no mapping for as badSession, and those
-        // are usually transient. Wiping the login is only right if it cannot connect at all.
-        const sessionIsBad = code === DisconnectReason.badSession && ++this.badSessionCloses >= MAX_BAD_SESSION_CLOSES;
-        if (code === DisconnectReason.loggedOut || code === DisconnectReason.forbidden || sessionIsBad) {
-          this.invalidateSession(`WhatsApp session was invalidated (${code}). Pair this backend again.`);
-        } else if (code === DisconnectReason.connectionReplaced || code === DisconnectReason.multideviceMismatch) {
+        const closed = describeDisconnect(update.lastDisconnect?.error);
+        this.lastReason = closed.reason;
+        if (closed.deviceRemoved) {
+          this.discardSignIn(intent, closed.reason);
+        } else if (closed.code === DisconnectReason.connectionReplaced || closed.code === DisconnectReason.multideviceMismatch) {
+          // Reconnecting would push the other copy off, which would push this one off again.
           this.stopped = true;
-          this.terminalError = new Error(`WhatsApp connection stopped (${code}). Resolve the linked-device conflict, then restart the server.`);
+          this.terminalError = new Error(closed.code === DisconnectReason.connectionReplaced
+            ? 'Another copy of this sign-in connected from somewhere else, so this server stopped to keep the two from '
+              + 'pushing each other off. Give each program its own sign-in folder and link it as its own device '
+              + '(WhatsApp allows several linked devices), then restart this server. The sign-in was kept.'
+            : `${closed.reason} Restart the server; the sign-in was kept.`);
+          log.warn(this.terminalError.message);
+          this.setState('stopped');
           this.cancelReconnect();
           this.closeSocket();
         } else {
+          const restart = closed.code === DisconnectReason.restartRequired;
+          if (!restart) {
+            const linked = !!state.creds.me?.id;
+            if (linked) log.warn(`WhatsApp connection dropped: ${closed.reason} Reconnecting by itself; the sign-in is kept.`);
+            else log.info(`${closed.reason} A new QR code follows with the next attempt.`);
+            this.setState(linked ? 'reconnecting' : 'waiting_for_link');
+          }
           this.closeSocket();
-          this.scheduleReconnect(intent, code === DisconnectReason.restartRequired);
+          this.scheduleReconnect(intent, restart);
         }
       }
     });
@@ -560,60 +710,102 @@ export class BaileysService implements WhatsAppBackend {
     });
   }
 
+  /** Saving to the sign-in folder failed (for example a full disk): drop the connection and try again later. */
   private eventFailure(error: unknown, generation: number): void {
     if (generation !== this.generation || this.stopped) return;
-    log.error('Baileys event persistence failed; stopping the connection:', error);
-    this.terminalError = new Error('Baileys could not persist session or history data. Check the session directory and restart the server.');
-    this.stopped = true;
-    this.cancelReconnect();
+    log.error('Could not save WhatsApp data to the sign-in folder; reconnecting later:', error);
+    this.lastReason = 'This server could not save WhatsApp data to the sign-in folder (is the disk full or the folder read-only?). '
+      + 'The sign-in is kept.';
+    this.setState('reconnecting');
     this.closeSocket();
+    this.scheduleReconnect(this.intent, false);
   }
 
-  private invalidateSession(reason: string): void {
-    this.stopped = true;
-    this.terminalError = new Error(reason);
+  /**
+   * WhatsApp clearly said this device was removed. Set the old sign-in aside as a dated backup
+   * (so a wrong decision can be undone), clear it, and offer a fresh link without a restart.
+   */
+  private discardSignIn(intent: number, reason: string): void {
     this.cancelReconnect();
     this.closeSocket();
     this.stopEvents();
-    try { this.store?.clear(); }
-    catch (error) {
-      log.error('Could not clear invalid Baileys credentials:', error);
-      this.terminalError = new Error(`${reason} Local credentials could not be cleared; check the session directory before restarting.`);
-    } finally {
-      this.historyRequests.clear();
-      this.historyInflight.clear();
+    this.historyRequests.clear();
+    this.historyInflight.clear();
+    let backup: string | undefined;
+    try {
+      if (this.store) {
+        backup = backupSignIn(this.store, this.sessionDir, this.deps.keepBackups ?? SIGN_IN_BACKUPS_KEPT);
+        this.store.clear();
+      }
+    } catch (error) {
+      log.error('Could not set the old sign-in aside safely, so it was left untouched:', error);
+      this.stopped = true;
+      this.terminalError = new Error(`${reason} The old sign-in could not be backed up, so it was left in place. `
+        + 'Free some disk space and restart the server, or use the logout tool to start over.');
+      this.setState('stopped');
       this.notifySessionInvalidated();
+      return;
     }
+    log.warn(`${reason} ${backup ? `The old sign-in was set aside as ${backup}.` : 'There was no saved sign-in to keep.'} `
+      + 'Link this server again with get_qr_code or request_pairing_code.');
+    this.notifySessionInvalidated();
+    this.reconnectAttempts = 0;
+    this.setState('waiting_for_link');
+    this.scheduleReconnect(intent, false);
   }
 
   private scheduleReconnect(intent: number, restartRequired: boolean): void {
     if (this.stopped || this.reconnectTimer) return;
-    if (this.reconnectAttempts >= MAX_RECONNECT_ATTEMPTS) {
-      this.stopped = true;
-      this.terminalError = new Error('Baileys reconnect attempts exhausted. Check connectivity and restart the server.');
-      this.closeSocket();
-      return;
+    const slow = this.deps.slowReconnectDelayMs ?? SLOW_RECONNECT_DELAY_MS;
+    const delay = restartRequired ? 100 : reconnectDelay(this.reconnectAttempts, this.deps.reconnectDelayMs ?? 1_000, slow);
+    if (!restartRequired) {
+      if (this.reconnectAttempts === QUICK_RECONNECT_ATTEMPTS && this.connectionState !== 'waiting_for_link') {
+        log.warn(`Still not connected after ${QUICK_RECONNECT_ATTEMPTS} quick attempts. `
+          + `This server keeps trying every ${minutes(slow)} for as long as it runs.`);
+      }
+      this.reconnectAttempts++;
     }
-    const delay = restartRequired ? 100 : Math.min((this.deps.reconnectDelayMs ?? 1_000) * 2 ** this.reconnectAttempts, 60_000);
-    this.reconnectAttempts++;
-    this.reconnectTimer = setTimeout(() => {
-      this.reconnectTimer = undefined;
+    const run = () => {
+      this.cancelReconnect();
+      this.lastAttemptAt = Date.now();
       void this.enqueue(async () => {
         if (this.stopped || this.intent !== intent) return;
         this.closeSocket();
+        const store = this.openStore();
+        this.startEvents(store);
         await this.openSocket(intent);
       }).catch(error => {
         if (this.stopped || this.intent !== intent) return;
-        log.warn('Baileys reconnect failed:', error);
+        this.closeSocket();
+        if (error instanceof SessionInUseError) {
+          this.waitForOtherProgram(error, intent);
+          return;
+        }
+        this.lastReason = `The last reconnect attempt failed: ${error instanceof Error ? error.message : String(error)}`;
+        log.warn('WhatsApp reconnect attempt failed; trying again later:', error);
         this.scheduleReconnect(intent, false);
       });
-    }, delay);
+    };
+    this.pendingReconnect = run;
+    this.nextAttemptAt = Date.now() + delay;
+    this.reconnectTimer = setTimeout(run, delay);
     this.reconnectTimer.unref?.();
+  }
+
+  /** Someone is waiting for WhatsApp: try now instead of at the next slow-paced attempt. */
+  private retrySoon(): void {
+    const run = this.pendingReconnect;
+    if (!run || !this.reconnectTimer || this.stopped || this.nextAttemptAt === undefined) return;
+    const now = Date.now();
+    if (this.nextAttemptAt - now <= 1_000 || now - this.lastAttemptAt < MIN_ATTEMPT_SPACING_MS) return;
+    run();
   }
 
   private cancelReconnect(): void {
     if (this.reconnectTimer) clearTimeout(this.reconnectTimer);
     this.reconnectTimer = undefined;
+    this.pendingReconnect = undefined;
+    this.nextAttemptAt = undefined;
   }
 
   private closeSocket(): void {
@@ -639,6 +831,8 @@ export class BaileysService implements WhatsAppBackend {
     ++this.generation;
     this.stopped = true;
     this.ready = false;
+    this.lastReason = 'The server is shutting down.';
+    this.setState('stopped');
     this.cancelReconnect();
     return this.enqueue(async () => {
       this.closeSocket();
@@ -653,6 +847,8 @@ export class BaileysService implements WhatsAppBackend {
     ++this.generation;
     this.stopped = true;
     this.ready = false;
+    this.lastReason = 'This server was logged out on request.';
+    this.setState('stopped');
     this.cancelReconnect();
     return this.enqueue(async () => {
       let logoutError: unknown;
@@ -705,8 +901,9 @@ export class BaileysService implements WhatsAppBackend {
   }
 
   async waitForAuthOutcome(timeoutMs = 25_000): Promise<void> {
+    this.retrySoon();
     const deadline = Date.now() + timeoutMs;
-    while (!this.ready && !this.latestQr && !this.latestPairing && !this.stopped && Date.now() < deadline) {
+    while (!this.ready && !this.latestQr && !this.latestPairing && !this.stopped && !this.lockError && Date.now() < deadline) {
       await new Promise(resolve => setTimeout(resolve, Math.min(100, Math.max(1, deadline - Date.now()))));
     }
   }
@@ -715,22 +912,69 @@ export class BaileysService implements WhatsAppBackend {
     await this.waitForAuthOutcome(timeoutMs);
     if (this.ready) return;
     if (this.terminalError) throw this.terminalError;
-    if (this.latestQr || this.latestPairing) throw new Error('WhatsApp is not authenticated: use get_qr_code or request_pairing_code to link this backend.');
+    if (this.lockError) throw this.lockError;
+    if (this.latestQr || this.latestPairing || this.connectionState === 'waiting_for_link') {
+      throw new Error('WhatsApp is not authenticated: use get_qr_code or request_pairing_code to link this backend.');
+    }
+    if (this.connectionState === 'reconnecting') throw new Error(this.connectionStatus().summary);
     throw new Error('WhatsApp is not connected. Start the server or wait for reconnection and try again.');
+  }
+
+  /** What the link is doing right now, in plain words. */
+  private connectionStatus(): ConnectionStatus {
+    const since = new Date(this.stateSince).toISOString();
+    const next = this.nextAttemptAt !== undefined ? new Date(this.nextAttemptAt).toISOString() : undefined;
+    const retrying = this.connectionState === 'reconnecting' || this.connectionState === 'waiting_for_other_program';
+    let summary: string;
+    switch (this.connectionState) {
+      case 'linked':
+        summary = 'Linked and connected to WhatsApp.';
+        break;
+      case 'connecting':
+        summary = 'Connecting to WhatsApp.';
+        break;
+      case 'waiting_for_link':
+        summary = 'Not linked to a phone yet. Use get_qr_code (or request_pairing_code) and link it on the phone under '
+          + 'Settings > Linked devices.';
+        break;
+      case 'reconnecting':
+        summary = `The connection to WhatsApp has been down since ${since}. This server is reconnecting by itself `
+          + `(attempt ${this.reconnectAttempts}${next ? `, next try at ${next}` : ', trying now'}). `
+          + 'The sign-in is kept, so nothing needs to be scanned.'
+          + (this.lastReason ? ` Last reason: ${this.lastReason}` : '');
+        break;
+      case 'waiting_for_other_program':
+        summary = `${this.lockError?.message ?? 'Another program is using this sign-in.'} `
+          + 'This server keeps checking and takes over when the other program closes.';
+        break;
+      default:
+        summary = this.terminalError?.message ?? this.lastReason ?? 'The connection is stopped.';
+    }
+    return {
+      state: this.connectionState,
+      summary,
+      since,
+      ...(this.lastReason ? { lastReason: this.lastReason } : {}),
+      ...(retrying ? { attempts: this.reconnectAttempts } : {}),
+      ...(retrying && next ? { nextAttemptAt: next } : {}),
+      signInFolder: this.sessionDir,
+    };
   }
 
   getStatus(): BackendStatus {
     const lastSyncAt = this.store?.getMeta<number>('history_synced_at');
     const counts = this.store?.getCounts();
     const hasData = !!counts && counts.messageCount + counts.chatCount + counts.contactCount > 0;
+    const problem = this.terminalError ?? this.lockError;
     return {
       backend: this.backend,
       authenticated: this.ready,
+      connection: this.connectionStatus(),
       history: {
         state: this.historySyncing && this.ready ? 'syncing' : lastSyncAt || hasData ? 'available' : 'unavailable',
         ...counts,
         ...(lastSyncAt ? { lastSyncAt } : {}),
-        note: (this.terminalError ? `${this.terminalError.message} ` : '')
+        note: (problem ? `${problem.message} ` : '')
           + (!lastSyncAt && hasData ? 'Phone history has not arrived; only locally observed records are currently available. ' : '') + HISTORY_NOTE,
       },
     };

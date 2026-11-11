@@ -4,7 +4,7 @@ import { mkdtempSync, rmSync } from 'node:fs';
 import { hostname, tmpdir } from 'node:os';
 import { join, resolve, sep } from 'node:path';
 import { BufferJSON, proto, type SignalDataSet, type WAMessage } from '@whiskeysockets/baileys';
-import { BaileysStore } from '../src/services/baileys-store.js';
+import { BaileysStore, SessionInUseError } from '../src/services/baileys-store.js';
 
 const stores: BaileysStore[] = [];
 const directories: string[] = [];
@@ -40,6 +40,42 @@ afterEach(() => {
     }
     rmSync(target, { recursive: true, force: true });
   }
+});
+
+describe('BaileysStore sign-in ownership and backups', () => {
+  it('tells a second program the real remedy when the sign-in is already in use', () => {
+    const path = directory();
+    open(path);
+    let error: unknown;
+    try { new BaileysStore(path); } catch (caught) { error = caught; }
+    expect(error).toBeInstanceOf(SessionInUseError);
+    const message = (error as Error).message;
+    expect(message).toContain('already in use by another program');
+    expect(message).toContain(`process ${process.pid}`);
+    expect(message).toContain(resolve(path));
+    expect(message).toContain('give this one its own folder with BAILEYS_SESSION_DIR');
+    expect(message).toContain('link it as its own device');
+    expect(message).toContain('WhatsApp allows several linked devices');
+  });
+
+  it('knows whether it holds a linked account and copies itself into a consistent backup', async () => {
+    const path = directory();
+    const store = open(path);
+    expect(store.hasLinkedAccount()).toBe(false);
+    const { saveCreds } = await store.createAuthState();
+    await saveCreds();
+    expect(store.hasLinkedAccount()).toBe(false);
+    await saveCreds({ me: { id: peer } } as never);
+    expect(store.hasLinkedAccount()).toBe(true);
+    store.upsertMessages([message('kept', 100)]);
+    const copy = join(path, 'backups', "it's a copy.sqlite");
+    store.backupTo(copy);
+    const db = new Database(copy, { readonly: true });
+    try {
+      expect((db.prepare('SELECT COUNT(*) AS n FROM messages').get() as { n: number }).n).toBe(1);
+    } finally { db.close(); }
+    expect(() => store.backupTo(copy)).toThrow();
+  });
 });
 
 describe('BaileysStore auth persistence', () => {

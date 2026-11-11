@@ -237,8 +237,14 @@ async function getQrCodeImage(
   whatsappService: WhatsAppBackend
 ): Promise<CallToolResult> {
   try {
-    const qrString = whatsappService.getLatestQrCode();
-    
+    let qrString = whatsappService.getLatestQrCode();
+    if (!qrString && !whatsappService.isAuthenticated()) {
+      // Between QR codes the backend may be waiting before its next attempt; asking for a
+      // code brings that attempt forward, so wait briefly for the fresh one.
+      await whatsappService.waitForAuthOutcome(10_000);
+      qrString = whatsappService.getLatestQrCode();
+    }
+
     // Check if the client is already authenticated
     if (whatsappService.isAuthenticated()) {
       log.info('Client is already authenticated, no QR code needed');

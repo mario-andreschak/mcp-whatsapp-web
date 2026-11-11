@@ -1,12 +1,14 @@
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { EventEmitter } from 'node:events';
 import { Readable } from 'node:stream';
-import { mkdtempSync, rmSync } from 'node:fs';
+import { mkdtempSync, readdirSync, rmSync } from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
+import Database from 'better-sqlite3';
 import { DisconnectReason, type UserFacingSocketConfig, type WAMessage, type WAMessageKey, type WAVersion } from '@whiskeysockets/baileys';
 import {
-  BaileysService, decodeMessageId, encodeMessageId, linkedDeviceBrowser, parseWaVersion, type BaileysSocket,
+  BaileysService, backupSignIn, decodeMessageId, describeDisconnect, encodeMessageId, linkedDeviceBrowser, parseWaVersion,
+  reconnectDelay, type BaileysSocket,
 } from '../src/services/baileys.js';
 import { BaileysStore } from '../src/services/baileys-store.js';
 
@@ -22,7 +24,9 @@ const oldMessage = (key: Partial<WAMessageKey> = {}, body = 'hello', time = 1700
   message: { conversation: body }, messageTimestamp: time,
 });
 
-function fixture(options: { directory?: string; requestTimeout?: number; resolveVersion?: () => Promise<WAVersion | undefined> } = {}) {
+function fixture(options: {
+  directory?: string; requestTimeout?: number; resolveVersion?: () => Promise<WAVersion | undefined>; slowReconnectDelayMs?: number;
+} = {}) {
   const directory = options.directory ?? mkdtempSync(path.join(os.tmpdir(), 'wa-baileys-service-'));
   if (!options.directory) directories.push(directory);
   const sockets: ReturnType<typeof fakeSocket>[] = [];
@@ -36,7 +40,8 @@ function fixture(options: { directory?: string; requestTimeout?: number; resolve
   const downloadMedia = vi.fn(async () => Readable.from([Buffer.from('downloaded')]));
   const service = new BaileysService({ sessionDir: directory, socketFactory,
     downloadMedia: downloadMedia as never, reconnectDelayMs: 1, historyRequestTimeoutMs: options.requestTimeout ?? 25,
-    ...(options.resolveVersion ? { resolveVersion: options.resolveVersion } : {}) });
+    ...(options.resolveVersion ? { resolveVersion: options.resolveVersion } : {}),
+    ...(options.slowReconnectDelayMs ? { slowReconnectDelayMs: options.slowReconnectDelayMs } : {}) });
   services.push(service);
   return { service, sockets, configs, socketFactory, directory, downloadMedia };
 }
@@ -159,48 +164,101 @@ describe('Baileys lifecycle and authentication (offline)', () => {
     expect(service.getLatestPairingCode()).toBeNull();
   });
 
-  it('invalidates credentials and listeners on remote logout without reconnecting', async () => {
+  it('sets a removed device\'s sign-in aside as a dated backup, clears it and offers a fresh link', async () => {
     vi.useFakeTimers();
-    const { service, socket, configs, sockets } = await connected();
+    const { service, socket, configs, sockets, directory } = await connected();
     const invalidated = vi.fn();
     service.onSessionInvalidated(invalidated);
-    socket.ev.emit('creds.update', { registered: true });
+    socket.ev.emit('creds.update', { registered: true, me: { id: user } });
     sync(socket, [oldMessage()]);
     close(socket, DisconnectReason.loggedOut);
     expect(service.isAuthenticated()).toBe(false);
     expect(invalidated).toHaveBeenCalledOnce();
     expect(service.getStatus().history.messageCount).toBe(0);
-    await vi.advanceTimersByTimeAsync(100000);
-    expect(sockets).toHaveLength(1);
-    await service.initialize();
+
+    const backups = readdirSync(path.join(directory, 'backups'));
+    expect(backups).toHaveLength(1);
+    expect(backups[0]).toMatch(/^session-\d{4}-\d{2}-\d{2}T.+\.sqlite$/);
+    const copy = new Database(path.join(directory, 'backups', backups[0]), { readonly: true });
+    try {
+      expect((copy.prepare('SELECT COUNT(*) AS n FROM messages').get() as { n: number }).n).toBe(1);
+      expect((copy.prepare('SELECT COUNT(*) AS n FROM credentials').get() as { n: number }).n).toBe(1);
+    } finally { copy.close(); }
+
+    expect(service.getStatus().connection?.state).toBe('waiting_for_link');
+    await vi.advanceTimersByTimeAsync(10);
+    expect(sockets).toHaveLength(2);
     expect(configs[1].auth.creds.registered).toBe(false);
+    expect(configs[1].auth.creds.me).toBeUndefined();
+    sockets[1].ev.emit('connection.update', { qr: 'fresh-qr' });
+    expect(service.getLatestQrCode()).toBe('fresh-qr');
   });
 
-  it('keeps the login through a stray stream error that Baileys reports as a bad session', async () => {
+  it('also treats a device_removed conflict as a real sign-out, whatever its code', () => {
+    expect(describeDisconnect({ output: { statusCode: 440 }, data: { tag: 'conflict', attrs: { type: 'device_removed' } } }).deviceRemoved).toBe(true);
+    expect(describeDisconnect({ output: { statusCode: 440 }, data: { tag: 'conflict', attrs: { type: 'replaced' } } }).deviceRemoved).toBe(false);
+    expect(describeDisconnect({ output: { statusCode: 401 } })).toMatchObject({ code: 401, deviceRemoved: true });
+    for (const code of [403, 408, 428, 500, 503, 515, 999]) {
+      expect(describeDisconnect({ output: { statusCode: code } }).deviceRemoved).toBe(false);
+    }
+    expect(describeDisconnect(undefined)).toEqual({ reason: 'The connection dropped.', deviceRemoved: false });
+    expect(describeDisconnect({ message: 'QR refs attempts ended', output: { statusCode: 408 } }).reason).toContain('QR code expired');
+  });
+
+  it('keeps the sign-in through repeated bad-session errors and a refused account', async () => {
+    vi.useFakeTimers();
+    const { service, socket, sockets, directory } = await connected();
+    const invalidated = vi.fn();
+    service.onSessionInvalidated(invalidated);
+    socket.ev.emit('creds.update', { registered: true, me: { id: user } });
+    sync(socket, [oldMessage()]);
+    for (let round = 0; round < 6; round++) {
+      close(sockets[sockets.length - 1], round === 5 ? DisconnectReason.forbidden : DisconnectReason.badSession);
+      await vi.advanceTimersByTimeAsync(1_000);
+    }
+    expect(invalidated).not.toHaveBeenCalled();
+    expect(sockets).toHaveLength(7);
+    expect(service.getStatus().history.messageCount).toBe(1);
+    expect(() => readdirSync(path.join(directory, 'backups'))).toThrow();
+    expect(service.getStatus().connection).toMatchObject({ state: 'reconnecting', lastReason: expect.stringContaining('refused') });
+  });
+
+  it('keeps only the newest few sign-in backups', async () => {
+    const directory = mkdtempSync(path.join(os.tmpdir(), 'wa-baileys-backups-'));
+    directories.push(directory);
+    const store = new BaileysStore(directory);
+    try {
+      const auth = await store.createAuthState();
+      await auth.saveCreds({ me: { id: user } } as never);
+      const names: string[] = [];
+      for (let index = 0; index < 5; index++) {
+        names.push(path.basename(backupSignIn(store, directory, 3, new Date(Date.UTC(2026, 10, 11, 0, 0, index)))!));
+      }
+      expect(readdirSync(path.join(directory, 'backups')).sort()).toEqual(names.slice(2));
+    } finally { store.close(); }
+  });
+
+  it('does not make a backup when there is nothing to keep', async () => {
+    const directory = mkdtempSync(path.join(os.tmpdir(), 'wa-baileys-backups-'));
+    directories.push(directory);
+    const store = new BaileysStore(directory);
+    try {
+      expect(backupSignIn(store, directory)).toBeUndefined();
+    } finally { store.close(); }
+  });
+
+  it('leaves the sign-in untouched when it cannot be backed up', async () => {
     vi.useFakeTimers();
     const { service, socket, sockets } = await connected();
-    const invalidated = vi.fn();
-    service.onSessionInvalidated(invalidated);
+    socket.ev.emit('creds.update', { registered: true, me: { id: user } });
     sync(socket, [oldMessage()]);
-    close(socket, DisconnectReason.badSession);
-    expect(invalidated).not.toHaveBeenCalled();
+    vi.spyOn(BaileysStore.prototype, 'backupTo').mockImplementation(() => { throw new Error('disk full'); });
+    close(socket, DisconnectReason.loggedOut);
     expect(service.getStatus().history.messageCount).toBe(1);
-    await vi.advanceTimersByTimeAsync(100000);
-    expect(sockets).toHaveLength(2);
-  });
-
-  it('gives up on a session that keeps failing without ever opening', async () => {
-    vi.useFakeTimers();
-    const { service, sockets } = await connected();
-    const invalidated = vi.fn();
-    service.onSessionInvalidated(invalidated);
-    close(sockets[0], DisconnectReason.badSession);
-    await vi.advanceTimersByTimeAsync(100000);
-    close(sockets[1], DisconnectReason.badSession);
-    await vi.advanceTimersByTimeAsync(100000);
-    expect(invalidated).not.toHaveBeenCalled();
-    close(sockets[2], DisconnectReason.badSession);
-    expect(invalidated).toHaveBeenCalledOnce();
+    await expect(service.ensureReady(0)).rejects.toThrow('could not be backed up');
+    expect(service.getStatus().connection?.state).toBe('stopped');
+    await vi.advanceTimersByTimeAsync(600_000);
+    expect(sockets).toHaveLength(1);
   });
 
   it('clears local credentials and invalidates access even when remote logout fails', async () => {
@@ -216,7 +274,7 @@ describe('Baileys lifecycle and authentication (offline)', () => {
     expect(restored.configs[0].auth.creds.registered).toBe(false);
   });
 
-  it('limits repeated reconnects and suppresses stale socket callbacks', async () => {
+  it('suppresses stale socket callbacks after a reconnect', async () => {
     vi.useFakeTimers();
     const { service, sockets } = await connected();
     const stale = sockets[0].ev.listeners('connection.update')[0];
@@ -225,12 +283,118 @@ describe('Baileys lifecycle and authentication (offline)', () => {
     expect(sockets).toHaveLength(2);
     stale({ connection: 'open' });
     expect(service.isAuthenticated()).toBe(false);
+  });
+
+  it('spaces reconnect attempts quickly at first, then at a slow capped pace, forever', () => {
+    expect([0, 1, 2, 3, 4, 5, 6, 7].map(attempt => reconnectDelay(attempt))).toEqual([1_000, 2_000, 4_000, 8_000, 16_000, 32_000, 60_000, 60_000]);
+    for (const attempt of [8, 9, 50, 10_000]) expect(reconnectDelay(attempt)).toBe(300_000);
+    expect(reconnectDelay(9, 1_000, 120_000)).toBe(120_000);
+  });
+
+  it('never gives up reconnecting and recovers by itself when the network comes back', async () => {
+    vi.useFakeTimers();
+    const { service, socket, sockets } = await connected();
+    socket.ev.emit('creds.update', { registered: true, me: { id: user } });
+    const downAt = Date.now();
     for (let attempt = 1; attempt <= 8; attempt++) {
-      close(sockets[sockets.length - 1]);
-      await vi.advanceTimersByTimeAsync(1000);
+      close(sockets[sockets.length - 1], DisconnectReason.connectionClosed);
+      await vi.advanceTimersByTimeAsync(200);
     }
     expect(sockets).toHaveLength(9);
-    await expect(service.ensureReady(0)).rejects.toThrow('reconnect attempts exhausted');
+
+    // After the quick attempts it waits five minutes between tries, without ever stopping.
+    for (let slow = 1; slow <= 12; slow++) {
+      close(sockets[sockets.length - 1], DisconnectReason.connectionClosed);
+      await vi.advanceTimersByTimeAsync(299_000);
+      expect(sockets).toHaveLength(9 + slow - 1);
+      await vi.advanceTimersByTimeAsync(1_000);
+      expect(sockets).toHaveLength(9 + slow);
+    }
+
+    const status = service.getStatus().connection!;
+    expect(status.state).toBe('reconnecting');
+    expect(status.since).toBe(new Date(downAt).toISOString());
+    expect(status.attempts).toBe(20);
+    expect(status.summary).toContain('reconnecting by itself');
+    expect(status.summary).toContain('nothing needs to be scanned');
+    expect(status.lastReason).toContain('network interruption');
+    await expect(service.ensureReady(0)).rejects.toThrow('reconnecting by itself');
+
+    sockets[sockets.length - 1].ev.emit('connection.update', { connection: 'open' });
+    expect(service.isAuthenticated()).toBe(true);
+    expect(service.getStatus().connection).toMatchObject({ state: 'linked', summary: 'Linked and connected to WhatsApp.' });
+
+    // A working connection resets the pace: the next drop is retried quickly again.
+    const before = sockets.length;
+    close(sockets[sockets.length - 1], DisconnectReason.connectionClosed);
+    await vi.advanceTimersByTimeAsync(5);
+    expect(sockets).toHaveLength(before + 1);
+  });
+
+  it('tries at once instead of waiting for the slow pace when someone asks for WhatsApp', async () => {
+    vi.useFakeTimers();
+    const { service, socket, sockets } = await connected();
+    socket.ev.emit('creds.update', { registered: true, me: { id: user } });
+    for (let attempt = 1; attempt <= 9; attempt++) {
+      close(sockets[sockets.length - 1], DisconnectReason.timedOut);
+      await vi.advanceTimersByTimeAsync(200);
+    }
+    expect(sockets).toHaveLength(9);
+    await vi.advanceTimersByTimeAsync(31_000);
+    await service.waitForAuthOutcome(0);
+    await vi.advanceTimersByTimeAsync(0);
+    expect(sockets).toHaveLength(10);
+    // But not over and over: attempts stay at least half a minute apart.
+    close(sockets[sockets.length - 1], DisconnectReason.timedOut);
+    await service.waitForAuthOutcome(0);
+    await vi.advanceTimersByTimeAsync(0);
+    expect(sockets).toHaveLength(10);
+  });
+
+  it('keeps offering new QR codes while nobody has linked it yet, instead of giving up', async () => {
+    vi.useFakeTimers();
+    const { service, sockets } = fixture();
+    await service.initialize();
+    for (let round = 0; round < 12; round++) {
+      const current = sockets[sockets.length - 1];
+      current.ev.emit('connection.update', { qr: `qr-${round}` });
+      expect(service.getStatus().connection?.state).toBe('waiting_for_link');
+      current.ev.emit('connection.update', {
+        connection: 'close', lastDisconnect: { error: { message: 'QR refs attempts ended', output: { statusCode: 408 } } },
+      });
+      await vi.advanceTimersByTimeAsync(300_000);
+    }
+    expect(sockets).toHaveLength(13);
+    expect(service.getStatus().connection).toMatchObject({ state: 'waiting_for_link', lastReason: expect.stringContaining('QR code expired') });
+    await expect(service.ensureReady(0)).rejects.toThrow('not authenticated');
+  });
+
+  it('stops without fighting when another copy of the sign-in connects elsewhere', async () => {
+    vi.useFakeTimers();
+    const { service, socket, sockets } = await connected();
+    close(socket, DisconnectReason.connectionReplaced);
+    await vi.advanceTimersByTimeAsync(600_000);
+    expect(sockets).toHaveLength(1);
+    const status = service.getStatus().connection!;
+    expect(status.state).toBe('stopped');
+    expect(status.summary).toContain('its own sign-in folder');
+    expect(status.summary).toContain('The sign-in was kept');
+  });
+
+  it('takes over the sign-in by itself once the other program closes', async () => {
+    const first = await connected();
+    const second = fixture({ directory: first.directory, slowReconnectDelayMs: 50 });
+    await expect(second.service.initialize()).rejects.toThrow('already in use');
+    const waiting = second.service.getStatus().connection!;
+    expect(waiting.state).toBe('waiting_for_other_program');
+    expect(waiting.summary).toContain('its own folder');
+    expect(waiting.summary).toContain('own device');
+    expect(waiting.summary).toContain('takes over when the other program closes');
+    await first.service.destroy();
+    await vi.waitFor(() => expect(second.sockets).toHaveLength(1), { timeout: 5_000 });
+    second.sockets[0].ev.emit('connection.update', { connection: 'open' });
+    expect(second.service.getStatus().connection?.state).toBe('linked');
+    expect(second.service.getStatus().history.note).not.toContain('already in use');
   });
 
   it('rejects stale Signal-key writes after reconnect without poisoning the new authentication state', async () => {
@@ -274,17 +438,18 @@ describe('Baileys lifecycle and authentication (offline)', () => {
     expect(next.configs[0].auth.creds.registered).toBe(false);
   });
 
-  it('stops on a rejected credential save without an unhandled promise rejection', async () => {
+  it('drops the connection on a rejected credential save and tries again later, keeping the sign-in', async () => {
     const original = BaileysStore.prototype.createAuthState;
     vi.spyOn(BaileysStore.prototype, 'createAuthState').mockImplementation(async function (this: BaileysStore) {
       const auth = await original.call(this);
       return { ...auth, saveCreds: async () => { throw new Error('disk full'); } };
     });
-    const { service, socket } = await connected();
+    const { service, socket, sockets } = await connected();
     socket.ev.emit('creds.update', { registered: true });
     await vi.waitFor(() => expect(service.isAuthenticated()).toBe(false));
-    await expect(service.ensureReady(0)).rejects.toThrow('could not persist');
     expect(socket.end).toHaveBeenCalledOnce();
+    expect(service.getStatus().connection).toMatchObject({ state: 'reconnecting', lastReason: expect.stringContaining('could not save') });
+    await vi.waitFor(() => expect(sockets.length).toBeGreaterThan(1));
   });
 });
 

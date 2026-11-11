@@ -16,6 +16,7 @@ import util from 'util';
 
 import { WhatsAppMcpServer } from './server.js';
 import { log } from './utils/logger.js';
+import { packageVersion } from './utils/version.js';
 
 // Global reference to the server instance
 let serverInstance: WhatsAppMcpServer | null = null;
@@ -92,7 +93,7 @@ async function main() {
   // One-line banner with pid: multiple server processes share the same log
   // file, so the pid is what lets you tell their lifecycles apart.
   log.info(
-    `Starting WhatsApp MCP Server v1.2.0 (pid ${process.pid}, node ${process.version}, cwd ${process.cwd()})`,
+    `Starting WhatsApp MCP Server v${packageVersion()} (pid ${process.pid}, node ${process.version}, cwd ${process.cwd()})`,
   );
 
   serverInstance = new WhatsAppMcpServer();

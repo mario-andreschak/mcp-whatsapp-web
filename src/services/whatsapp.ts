@@ -13,7 +13,7 @@ const {
 import type WAWebJS from 'whatsapp-web.js';
 
 import { log } from '../utils/logger.js';
-import path from 'path';
+import { chooseSignInFolder, webjsFolderHoldsSignIn } from '../utils/data-paths.js';
 import { BrowserProcessManager } from '../utils/browser-process-manager.js';
 import { findBrowserExecutable } from '../utils/browser-finder.js';
 import type {
@@ -56,11 +56,17 @@ export class WhatsAppService implements WhatsAppBackend {
   private initPromise: Promise<void> | null = null;
   private destroyPromise: Promise<void> | null = null;
   private registeredBrowserPid: number | null = null;
-  // LocalAuth profile location. Overridable so multiple instances (or e2e
-  // tests) can run against isolated session directories.
-  private readonly sessionDataPath = process.env.WHATSAPP_SESSION_DIR
-    ? path.resolve(process.env.WHATSAPP_SESSION_DIR)
-    : path.join(process.cwd(), 'whatsapp-sessions');
+  // LocalAuth profile location. WHATSAPP_SESSION_DIR wins; otherwise an existing
+  // profile in the old working-directory place, else a fixed per-user place, so
+  // starting the server from another folder does not ask for a new QR code.
+  private readonly folder = chooseSignInFolder({
+    configured: process.env.WHATSAPP_SESSION_DIR,
+    settingName: 'WHATSAPP_SESSION_DIR',
+    folderName: 'whatsapp-sessions',
+    holdsSignIn: webjsFolderHoldsSignIn,
+  });
+  readonly sessionDir = this.folder.dir;
+  private readonly sessionDataPath = this.sessionDir;
   // Notified when the WhatsApp session itself becomes invalid (logout or
   // authentication failure) - used e.g. to revoke OAuth tokens.
   private sessionInvalidatedListeners: Array<() => void> = [];
@@ -68,13 +74,17 @@ export class WhatsAppService implements WhatsAppBackend {
   constructor(deps?: WhatsAppServiceDeps) {
     this.clientFactory = deps?.clientFactory;
     this.browserProcessManager = deps?.browserProcessManager ?? new BrowserProcessManager();
+    log.info(this.folder.explanation);
+    log.info(webjsFolderHoldsSignIn(this.sessionDir)
+      ? 'The sign-in folder holds a saved sign-in, so no QR code should be needed.'
+      : 'The sign-in folder holds no sign-in yet. Link this server with get_qr_code or request_pairing_code.');
     this.client = this.createClient();
   }
 
   private buildClientOptions(): WAWebJS.ClientOptions {
     return {
       authStrategy: new LocalAuth({
-        dataPath: this.sessionDataPath, // Project root by default; WHATSAPP_SESSION_DIR overrides
+        dataPath: this.sessionDataPath, // See `folder` above
       }),
       // web.js accepts false at runtime to retain the installed browser's real
       // user agent. Its type declaration still only allows strings.
