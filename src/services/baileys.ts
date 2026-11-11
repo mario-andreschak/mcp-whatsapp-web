@@ -1109,10 +1109,18 @@ export class BaileysService implements WhatsAppBackend {
       const chunks: Uint8Array[] = [];
       let bytes = 0;
       if (!response.body) throw new Error('The media URL returned no data.');
-      for await (const chunk of response.body) {
-        bytes += chunk.length;
-        if (bytes > MAX_MEDIA_BYTES) throw new Error('Media exceeds the 64 MiB transfer limit.');
-        chunks.push(chunk);
+      // Read with a reader instead of `for await`: whether a web stream can be looped over
+      // depends on which type definitions happen to be installed around this project.
+      const reader = response.body.getReader();
+      for (;;) {
+        const { done, value } = await reader.read();
+        if (done) break;
+        bytes += value.length;
+        if (bytes > MAX_MEDIA_BYTES) {
+          await reader.cancel().catch(() => {});
+          throw new Error('Media exceeds the 64 MiB transfer limit.');
+        }
+        chunks.push(value);
       }
       buffer = Buffer.concat(chunks);
       filename = path.basename(decodeURIComponent(new URL(source).pathname)) || 'attachment';
