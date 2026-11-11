@@ -176,6 +176,33 @@ describe('Baileys lifecycle and authentication (offline)', () => {
     expect(configs[1].auth.creds.registered).toBe(false);
   });
 
+  it('keeps the login through a stray stream error that Baileys reports as a bad session', async () => {
+    vi.useFakeTimers();
+    const { service, socket, sockets } = await connected();
+    const invalidated = vi.fn();
+    service.onSessionInvalidated(invalidated);
+    sync(socket, [oldMessage()]);
+    close(socket, DisconnectReason.badSession);
+    expect(invalidated).not.toHaveBeenCalled();
+    expect(service.getStatus().history.messageCount).toBe(1);
+    await vi.advanceTimersByTimeAsync(100000);
+    expect(sockets).toHaveLength(2);
+  });
+
+  it('gives up on a session that keeps failing without ever opening', async () => {
+    vi.useFakeTimers();
+    const { service, sockets } = await connected();
+    const invalidated = vi.fn();
+    service.onSessionInvalidated(invalidated);
+    close(sockets[0], DisconnectReason.badSession);
+    await vi.advanceTimersByTimeAsync(100000);
+    close(sockets[1], DisconnectReason.badSession);
+    await vi.advanceTimersByTimeAsync(100000);
+    expect(invalidated).not.toHaveBeenCalled();
+    close(sockets[2], DisconnectReason.badSession);
+    expect(invalidated).toHaveBeenCalledOnce();
+  });
+
   it('clears local credentials and invalidates access even when remote logout fails', async () => {
     const { service, socket, directory } = await connected();
     const invalidated = vi.fn();

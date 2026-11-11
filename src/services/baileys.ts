@@ -121,6 +121,8 @@ function timeout<T>(promise: Promise<T>, ms: number, label: string): Promise<T> 
   });
 }
 
+const MAX_BAD_SESSION_CLOSES = 3;
+
 export class BaileysService implements WhatsAppBackend {
   readonly backend = 'baileys' as const;
   private readonly deps: BaileysServiceDeps;
@@ -139,6 +141,7 @@ export class BaileysService implements WhatsAppBackend {
   private pairingPromise?: Promise<string>;
   private reconnectTimer?: ReturnType<typeof setTimeout>;
   private reconnectAttempts = 0;
+  private badSessionCloses = 0;
   private terminalError?: Error;
   private historySyncing = false;
   private readonly historySyncTypes = new Set<number>();
@@ -291,6 +294,7 @@ export class BaileysService implements WhatsAppBackend {
         this.latestQr = null;
         this.latestPairing = null;
         this.reconnectAttempts = 0;
+        this.badSessionCloses = 0;
         this.terminalError = undefined;
         this.historySyncing = !store.getMeta<number>('history_synced_at');
       }
@@ -300,7 +304,10 @@ export class BaileysService implements WhatsAppBackend {
         this.latestPairing = null;
         const error = update.lastDisconnect?.error;
         const code = (error as { output?: { statusCode?: number } } | undefined)?.output?.statusCode;
-        if (code === DisconnectReason.loggedOut || code === DisconnectReason.badSession || code === DisconnectReason.forbidden) {
+        // Baileys reports every stream error it has no mapping for as badSession, and those
+        // are usually transient. Wiping the login is only right if it cannot connect at all.
+        const sessionIsBad = code === DisconnectReason.badSession && ++this.badSessionCloses >= MAX_BAD_SESSION_CLOSES;
+        if (code === DisconnectReason.loggedOut || code === DisconnectReason.forbidden || sessionIsBad) {
           this.invalidateSession(`WhatsApp session was invalidated (${code}). Pair this backend again.`);
         } else if (code === DisconnectReason.connectionReplaced || code === DisconnectReason.multideviceMismatch) {
           this.stopped = true;
